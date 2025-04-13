@@ -17,6 +17,15 @@ python mcp_discord_bot.py --discord-token $DISCORD_TOKEN --config myconfig.toml
 ```
 
 
+# Checking MCP servers
+
+For SSE servers, you can check with curl, e.g.
+
+```sh
+curl -N http://localhost:8901/sse
+```
+
+
 
 # MCP resources
 

@@ -5,7 +5,10 @@ commands to interact with MCP tools.
 
 import json
 import asyncio
-from typing import Dict, Any, List, Optional, Union # Added Union for type hinting
+from typing import Dict, Any, List, Union
+
+import httpx
+import anyio
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -13,10 +16,12 @@ import structlog
 from ogbujipt.llm_wrapper import openai_api
 
 from mcp.client.session import ClientSession
-from mcp.client.sse import sse_client
+# from mcp.client.sse import sse_client
+from sse import sse_client  # Use vendored version to get the URL
 from mcp.types import CallToolResult, TextContent
 
 logger = structlog.get_logger(__name__)
+
 
 # Helper Function for Message Splitting
 async def send_long_message(sendable: Union[commands.Context, discord.Interaction], content: str, followup: bool = False):
@@ -114,6 +119,7 @@ class MCPCog(commands.Cog):
         successful_connections = sum(1 for r in results if r)
         logger.info(f'MCPCog loaded. Attempted {len(connect_tasks)} MCP connections, {successful_connections} successful.')
 
+
     async def cog_unload(self):
         '''
         Clean up MCP connections when the cog is unloaded.
@@ -132,41 +138,84 @@ class MCPCog(commands.Cog):
         logger.info('MCPCog unloaded.')
 
 
-    async def connect_mcp(self, url: str, name: str) -> bool: # Added return type hint
+    async def connect_mcp(self, url: str, name: str) -> bool:
         '''
         Connect to an MCP server. Returns True on success, False on failure.
         '''
-        logger.info(f'Attempting to connect to MCP server: {name} at {url}')
+        logger.info(f'Connecting to MCP server {name} at {url}')
         try:
-            # Assumes the ClientSession manages the connection state internally
-            # after being initialized with the sse_client context. If the connection
-            # object returned by sse_client needs to persist, this needs refactoring.
-            async with sse_client(url) as connection:
-                session = ClientSession(connection)
-                await session.connect() # Ensure connection happens within the context
+            import logging  # Needed to enable HTTPX debug logging
+            logging.basicConfig(level=logging.DEBUG)
 
-                # Store session. Store connection object if session needs it later.
-                self.mcp_connections[name] = (session, connection) # Store both for now
+            async with sse_client(url) as (read_stream, write_stream, endpoint_url):
+                logger.debug('SSE streams acquired', read=read_stream, write=write_stream, endpoint=endpoint_url)
 
-                # List available tools
-                result = await session.list_tools()
-                tools = [
-                    {
-                        'name': t.name,
-                        'description': t.description,
-                        'input_schema': t.inputSchema,
-                    }
-                    for t in result.tools
-                ]
-                self.mcp_tools[name] = tools
+                session = ClientSession(
+                    read_stream=read_stream,
+                    write_stream=write_stream
+                )
 
-                logger.info(f'Successfully connected to MCP server.', server_name=name, url=url, tool_count=len(tools))
+                async with session:
+                    logger.debug(f'Entered ClientSession context for {name}') # Confirm entry
+                    try:
+                        # Call initialize *within* the session context
+                        # Optionally increase timeout slightly? e.g., 30s
+                        await asyncio.wait_for(session.initialize(), timeout=30.0)
+                        logger.info(f'MCP Session initialized for {name}')
+
+                        # Store connection info *after* successful initialization
+                        # Note: The session context (__aexit__) will clean up the receive loop
+                        # when this 'async with session:' block finishes.
+                        # Storing 'session' might require careful handling later if you need
+                        # persistent connections. For now, let's get connection working.
+                        self.mcp_connections[name] = (session, (read_stream, write_stream))
+                        logger.debug(f'Stored connection for {name}')
+
+                        # List tools within the same context
+                        try:
+                            result = await asyncio.wait_for(session.list_tools(), timeout=15.0)
+                            tools = [
+                                {
+                                    'name': t.name,
+                                    'description': t.description,
+                                    'input_schema': t.inputSchema,
+                                }
+                                for t in result.tools
+                            ]
+                            self.mcp_tools[name] = tools
+                            logger.info(f'Successfully listed {len(tools)} tools for {name}')
+                        except asyncio.TimeoutError:
+                            logger.error(f'Tool listing timed out for {name}')
+                            if name in self.mcp_connections: del self.mcp_connections[name]
+                            return False # Connection failed if tools don't list
+                        except Exception as list_exc:
+                            logger.exception(f'Tool listing failed for {name}', exc_info=list_exc)
+                            if name in self.mcp_connections: del self.mcp_connections[name]
+                            return False
+
+                    except asyncio.TimeoutError:
+                        logger.error(f'Session initialization timeout for {name}')
+                        # No connection stored yet if init fails
+                        return False
+                    except Exception as init_exc:
+                        logger.exception(f'Session initialization failed for {name}', exc_info=init_exc)
+                        return False
+
+                # Context 'async with session:' exited here.
+                # BaseSession.__aexit__ was called, cancelling the _receive_loop task.
+                logger.debug(f'Exited ClientSession context for {name}')
+
+                # If we reached here, connection and tool listing succeeded
+                logger.info('Successfully connected to MCP server', server_name=name, url=url, tool_count=len(tools))
                 return True
+
         except Exception as e:
+            # Catch errors during sse_client connection itself or other setup issues
             logger.exception('Error connecting to MCP server.', server_name=name, url=url)
             if name in self.mcp_connections: del self.mcp_connections[name]
             if name in self.mcp_tools: del self.mcp_tools[name]
             return False
+
 
     async def execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> Union[CallToolResult, Dict[str, str]]:
         '''
@@ -174,8 +223,8 @@ class MCPCog(commands.Cog):
         '''
         logger.debug('Executing tool', tool_name=tool_name, tool_input=tool_input)
 
-        mcp_session: Optional[ClientSession] = None
-        server_name_found: Optional[str] = None
+        mcp_session: ClientSession | None = None
+        server_name_found: str | None = None
 
         # Find the correct MCP session for the tool
         for server_name, tools in self.mcp_tools.items():
@@ -219,10 +268,10 @@ class MCPCog(commands.Cog):
                 if text_contents:
                     return '\n'.join(text_contents)
                 else:
-                     logger.warning('CallToolResult received but contained no TextContent.', result_details=str(result))
+                     logger.warning('CallToolResult received but contained no TextContent', result_details=str(result))
                      return f'Tool executed, but returned no displayable text. (Result: {str(result)[:100]})'
             else:
-                 logger.warning('CallToolResult received with no "content" or empty content.', result_details=str(result))
+                 logger.warning('CallToolResult received with no "content" or empty content', result_details=str(result))
                  return f'Tool executed, but returned no content. (Result: {str(result)[:100]})'
         elif isinstance(result, dict) and 'error' in result:
             return f'Tool Error: {result['error']}'
