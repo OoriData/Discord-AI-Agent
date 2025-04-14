@@ -1,3 +1,4 @@
+# mcp_discord_bot.py
 '''
 Discord cog for MCP integration. Connects to MCP servers and provides
 commands to interact with MCP tools.
@@ -115,10 +116,8 @@ class MCPCog(commands.Cog):
         self.mcp_tools: Dict[str, List[Dict[str, Any]]] = {}
         self.message_history: Dict[int, List[Dict[str, Any]]] = {}
 
-        # --- New attributes for connection management ---
         self._connection_tasks: Dict[str, asyncio.Task] = {}
         self._shutdown_event = asyncio.Event()
-        # ---
 
         llm_init_params = {k: v for k, v in config.get('llm_endpoint', {}).items() if k in ALLOWED_FOR_LLM_INIT}
 
@@ -186,7 +185,7 @@ class MCPCog(commands.Cog):
                                 'input_schema': t.inputSchema,
                             } for t in result.tools
                         ]
-                        # --- Store live session and tools ---
+                        # Store live session and tools
                         self.mcp_connections[name] = session
                         self.mcp_tools[name] = tools
                         logger.info(f'Successfully listed {len(tools)} tools for {name}. Connection active.')
@@ -202,7 +201,7 @@ class MCPCog(commands.Cog):
                         if name in self.mcp_tools: del self.mcp_tools[name]
                         raise # Trigger reconnect
 
-                    # --- Connection is live - Keep context open ---
+                    # Connection is live - Keep context open
                     # Wait indefinitely until shutdown is signaled or connection breaks
                     await self._shutdown_event.wait()
 
@@ -220,12 +219,12 @@ class MCPCog(commands.Cog):
                 # Catch unexpected errors during connection or the wait loop
                 logger.exception(f'Unexpected error in connection task for {name}. Will attempt reconnect.', server_name=name, url=url)
 
-            # --- Cleanup before potential reconnect ---
+            # Cleanup before potential reconnect
             if name in self.mcp_connections: del self.mcp_connections[name]
             if name in self.mcp_tools: del self.mcp_tools[name]
             session = None # Clear session object
 
-            # --- Wait before retrying, unless shutting down ---
+            # Wait before retrying, unless shutting down
             if not self._shutdown_event.is_set():
                 logger.info(f'Waiting {reconnect_delay}s before reconnecting to {name}.')
                 try:
@@ -241,7 +240,7 @@ class MCPCog(commands.Cog):
                      logger.info(f'Reconnect wait for {name} cancelled.')
                      break # Exit loop
 
-        # --- Final Task Cleanup ---
+        # Final Task Cleanup
         logger.info(f'Connection management task for {name} finished.')
         if name in self.mcp_connections: del self.mcp_connections[name]
         if name in self.mcp_tools: del self.mcp_tools[name]
@@ -537,7 +536,7 @@ class MCPCog(commands.Cog):
             tool_calls_aggregated: List[Dict[str, Any]] = [] # Store unified tool call format
             assistant_message_dict: Dict[str, Any] = {'role': 'assistant', 'content': None} # Start with None content
 
-            # --- Initial LLM Call (Streaming or Non-Streaming) ---
+            # Initial LLM Call (Streaming or Non-Streaming)
             logger.debug(f'Initiating LLM call for channel {channel_id}', user_id=user_id, stream=stream, model=chat_params.get('model'))
             if stream:
                 # Streaming Logic
@@ -611,7 +610,7 @@ class MCPCog(commands.Cog):
                      await send_long_message(sendable, f'⚠️ Error communicating with AI: {str(api_exc)}', followup=send_followup, ephemeral=is_interaction)
                      return # Abort processing on API error
 
-            # --- Send Initial Response & Update History (if content or tools exist) ---
+            # Send Initial Response & Update History (if content or tools exist)
             sent_initial_message = False
             if initial_response_content.strip():
                 logger.debug(f'Sending initial LLM response to channel {channel_id}', length=len(initial_response_content), stream=stream)
@@ -633,7 +632,7 @@ class MCPCog(commands.Cog):
                 await send_long_message(sendable, 'I received your message but didn\'t have anything specific to add or do.', followup=send_followup, ephemeral=is_interaction)
                 return # End processing here if there's nothing to do
 
-            # --- Process Tool Calls (if any) ---
+            # Process Tool Calls (if any)
             if tool_calls_aggregated:
                 tool_results_for_history = []
                 any_tool_executed = False # Track if we actually ran any tool
@@ -725,7 +724,7 @@ class MCPCog(commands.Cog):
                          # Don't return here, history might still be useful? Or return? Let's return to be safe.
                          return
 
-                    # --- Send Follow-up & Update History ---
+                    # Send Follow-up & Update History
                     if follow_up_text.strip():
                         logger.debug(f'Sending follow-up LLM response to channel {channel_id}', length=len(follow_up_text), stream=stream)
                         await send_long_message(sendable, follow_up_text, followup=True) # Must be followup
@@ -827,7 +826,7 @@ class MCPCog(commands.Cog):
         await send_long_message(interaction, message.strip(), followup=True)
 
 
-    # --- Prefix Command Implementation ---
+    # Prefix form of chat command
     @commands.command(name='chat', help='Chat with the AI assistant (Prefix Command)')
     @commands.cooldown(1, 10, commands.BucketType.user) # Cooldown: 1 use per 10s per user
     async def chat_command(self, ctx: commands.Context, *, message: str):
@@ -861,7 +860,7 @@ class MCPCog(commands.Cog):
             # Avoid sending generic error here if _handle_chat_logic sends its own for internal errors.
 
 
-    # --- Slash Command Implementation ---
+    # Slash form of chat command
     @app_commands.command(name='chat', description='Chat with the AI assistant')
     @app_commands.describe(message='Your message to the AI')
     @app_commands.checks.cooldown(1, 10, key=lambda i: i.user.id) # Cooldown per user
@@ -920,68 +919,3 @@ class MCPCog(commands.Cog):
             logger.error(f'Failed to send slash command error message for interaction {interaction.id}: {e}')
         except Exception as e:
              logger.error(f'Generic exception sending slash command error for interaction {interaction.id}: {e}')
-
-
-# --- Cog Setup Function ---
-async def setup(bot: commands.Bot):
-    ''' Function called by discord.py to setup the Cog '''
-    # Configuration should be loaded here or passed into setup
-    # Using placeholder config structure matching the original example
-    # Make sure your actual config loading provides the correct paths/keys.
-    # Example placeholder - REPLACE with your actual config loading logic
-    config = {
-        'mcp': {
-            'server': [
-                # Example: uncomment and replace with your actual server details
-                # { 'name': 'mcp-gdrive-local', 'url': 'http://localhost:8901/sse' },
-                # { 'name': 'mcp-toys', 'url': 'http://localhost:8902/sse' },
-            ]
-        },
-        'llm_endpoint': {
-            # api_key should be handled by env var or secure config loading
-            # 'api_key': 'YOUR_API_KEY', # Best practice: Load from env or secure store
-            'base_url': 'http://localhost:1234/v1' # Example local endpoint (LM Studio/Ollama)
-            # 'model': 'Specify-Model-Here-If-Needed' # Optional: Define default model for endpoint
-        },
-        'llm_settings': {
-            'model': 'local-model', # Specify the model to use for generation (e.g., llama3, gpt-4o)
-            'temperature': 0.5
-        },
-        'system_message': 'You are a helpful Discord bot connected to MCP tools.',
-        'max_history_length': 15
-    }
-
-    # --- Actual Config Loading Recommendation (replace placeholder above) ---
-    # import tomllib # Use tomllib for Python 3.11+ TOML parsing
-    # config_path = os.getenv('MCP_BOT_CONFIG', 'config.toml') # Get path from env or default
-    # try:
-    #     with open(config_path, 'rb') as f:
-    #         config = tomllib.load(f)
-    #     logger.info(f'Configuration loaded successfully from {config_path}')
-    # except FileNotFoundError:
-    #     logger.error(f'Configuration file not found at {config_path}. MCPCog will not load.')
-    #     return # Prevent loading if config is missing
-    # except Exception as e:
-    #     logger.exception(f'Failed to load or parse configuration from {config_path}', error=e)
-    #     return # Prevent loading on config error
-    # --- End Config Loading Recommendation ---
-
-
-    # Basic check if MCP servers are configured before adding cog
-    if not config.get('mcp', {}).get('server'):
-         logger.warning('No MCP servers found in configuration. MCP features will be unavailable.')
-         # Decide if you want the cog to load without servers or not:
-         # return # Option: Uncomment to prevent loading the cog if no servers defined
-
-    if not config.get('llm_endpoint', {}).get('base_url'):
-        logger.error('LLM base_url is missing in configuration. Cog cannot function without it.')
-        return # Prevent loading if LLM endpoint is critically missing
-
-    try:
-        cog_instance = MCPCog(bot, config)
-        await bot.add_cog(cog_instance)
-        logger.info('MCPCog added to bot successfully.')
-    except Exception as e:
-        logger.exception('Failed to initialize or add MCPCog to bot', error=e)
-
-# --- End Cog Setup Function ---

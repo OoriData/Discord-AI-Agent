@@ -46,7 +46,6 @@ def setup_logging(classic_tracebacks: bool = False):
             )
         return None # No exception info, nothing to format
 
-    # --- Renderer Configuration ---
     console_renderer_kwargs = {'colors': True}
 
     if classic_tracebacks:
@@ -57,8 +56,7 @@ def setup_logging(classic_tracebacks: bool = False):
          logger.info('Configuring logging with standard (rich) tracebacks.')
          # When not classic, ConsoleRenderer uses its default (usually rich-based) exception formatting
 
-
-    # --- Structlog and Standard Library Logging Setup ---
+    # Structlog and Standard Library Logging Setup
     shared_processors = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_logger_name,
@@ -127,17 +125,16 @@ def load_config(config_path: str):
 
 
 def main(
-    config_path: str = None, # fire uses None if not provided
-    discord_token: str = None, # fire uses None if not provided
-    classic_tracebacks: bool = False # Defaults to False (fancy tracebacks)
+    config_path: str = None,
+    discord_token: str = None,
+    classic_tracebacks: bool = False # Default to fancy tracebacks
     ):
     '''Main function to launch the MCP Discord bot.'''
 
-    # --- Setup Logging FIRST ---
-    # This ensures subsequent logs use the correct format
+    # Setup Logging FIRST. Ensures subsequent logs use the correct format
     setup_logging(classic_tracebacks)
 
-    # --- Argument Handling (including environment variables as fallback) ---
+    # Argument Handling (including environment variables as fallback)
     if not discord_token:
         discord_token = os.environ.get('MCP_DISCORD_DISCORD_TOKEN')
         if not discord_token:
@@ -152,8 +149,6 @@ def main(
         else:
              logger.info(f'Using config path from MCP_DISCORD_CONFIG_PATH environment variable: {config_path}')
 
-
-    # --- Load Configuration ---
     try:
         config = load_config(config_path)
     except Exception:
@@ -161,7 +156,6 @@ def main(
         logger.critical('Failed to load configuration. Exiting.')
         sys.exit(1) # Exit if config fails
 
-    # --- Set up Discord Bot ---
     logger.info('Setting up Discord bot intents...')
     intents = discord.Intents.default()
     intents.message_content = True
@@ -169,7 +163,7 @@ def main(
 
     bot = commands.Bot(command_prefix=['!'], intents=intents, description='MCP Discord Bot')
 
-    # Create the Cog instance
+    # Create Cog instance
     logger.info('Initializing MCPCog...')
     mcp_cog = MCPCog(bot, config)
 
@@ -200,7 +194,6 @@ def main(
         logger.info(f'Bot logged in as {bot.user.name} (ID: {bot.user.id})')
         logger.info('Bot is ready and listening for commands.')
 
-    # --- Run the Bot ---
     logger.info('Starting bot...')
     try:
         bot.run(discord_token, log_handler=None) # Disable default discord.py logging handler if using structlog fully
