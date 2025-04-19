@@ -12,3 +12,6 @@ dependencies = [
     "rich>=14.0.0",
     "structlog>=25.2.0",
 ]
+
+[tool.poetry.dependencies]  # Uses new PEP 508 format. Pulling from GitHub because package is not yet on PyPI
+mcp-sse-client = "https://github.com/zanetworker/mcp-sse-client-python.git#f397a8e"
