@@ -2,6 +2,8 @@
 
 Discord bot for supporting AI/LLM chat applications powered by the Model Context Protocol (MCP), allowing for numerous integrations
 
+For general MCP resources, see Arkestra:cookbook/mcp/README.md
+
 # Configuration
 
 ```sh
@@ -35,26 +37,3 @@ For SSE servers, you can check with curl, e.g.
 ```sh
 curl -N http://localhost:8901/sse
 ```
-
-
-# MCP resources
-
-# General resources
-
-* [MCP Reddit](https://www.reddit.com/r/mcp/)
-
-# Issues
-
-See Uche's post on Reddit: https://www.reddit.com/r/mcp/comments/1jrbrfm/musings_on_mcps_architectural_problems_and_the/
-
-# Servers
-
-* [ACI.dev by Aipolabs](https://github.com/aipotheosis-labs/aipolabs-mcp)—basically a meta-MCP server. "Unified MCP server that can access unlimited tools from one MCP server"
-
-* ["10 awesome MCP servers to supercharge your workflows on…" (Twitter thread)](https://x.com/Saboo_Shubham_/status/1905455781761483093)
-* [awesome-mcp-servers (github)](https://github.com/punkpeye/awesome-mcp-servers?tab=readme-ov-file)
-
-# Clients
-
-* [awesome-mcp-clients (github)](https://github.com/punkpeye/awesome-mcp-clients?tab=readme-ov-file)
-

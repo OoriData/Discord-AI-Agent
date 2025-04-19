@@ -17,6 +17,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from mcp.server.fastmcp import FastMCP
+import mcp.server.fastmcp
+from sse_server_vendored import VendoredSseServerTransport
+mcp.server.fastmcp.SseServerTransport = VendoredSseServerTransport
+# Vendored from MCP SDK: mcp.client.sse
 
 import structlog
 logger = structlog.get_logger(__name__)

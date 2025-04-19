@@ -1,4 +1,4 @@
-# mcp_discord_bot.py
+# mcp_cog.py
 '''
 Discord cog for MCP integration. Connects to MCP servers and provides
 commands to interact with MCP tools.
@@ -21,7 +21,7 @@ from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceD
 
 from mcp.client.session import ClientSession
 # from mcp.client.sse import sse_client # Assuming sse_client handles anyio internally
-from sse import sse_client # Use vendored version, which includes the endpoint_url in return
+from sse_client_vendored import sse_client # Vendored version includes the endpoint_url in return
 from mcp.types import CallToolResult, TextContent
 
 # Needed for ClosedResourceError/BrokenResourceError handling if not imported via sse/mcp

@@ -1,4 +1,5 @@
-# Temporarily vendored from mcp SDK
+# sse_client_vendored.py
+# Temporarily vendored from MCP SDK: mcp.client.sse
 """
 sse.py (Needs Vendoring due to MCP SDK Bug/Limitation):
 
