@@ -182,7 +182,7 @@ class MCPCog(commands.Cog):
                 # MCPClient constructor likely attempts initial connection/handshake.
                 # It might raise errors here if the initial connection fails.
                 client = MCPClient(url) # Add headers/timeouts from config if needed
-                logger.info(f'MCPClient instance created for {name}. Attempting to list tools...')
+                logger.info(f'MCPClient instance created for {name}. Attempting to list tools…')
 
                 # 2. List Tools (Acts as connection check and fetches tool info)
                 # This call will likely handle the underlying SSE connection setup and MCP handshake implicitly.
@@ -205,15 +205,15 @@ class MCPCog(commands.Cog):
                 # Loop will terminate because _shutdown_event is set.
 
             except (ConnectError, ReadTimeout, ConnectionRefusedError) as conn_err:
-                 logger.warning(f'Connection failed for MCP server {name}: {type(conn_err).__name__}. Retrying...', server_name=name, error=str(conn_err))
+                 logger.warning(f'Connection failed for MCP server {name}: {type(conn_err).__name__}. Retrying…', server_name=name, error=str(conn_err))
             except asyncio.TimeoutError:
-                logger.error(f'Timeout connecting or listing tools for MCP server {name}. Retrying...', server_name=name)
+                logger.error(f'Timeout connecting or listing tools for MCP server {name}. Retrying…', server_name=name)
             except asyncio.CancelledError:
                 logger.info(f'Connection task for {name} cancelled.')
                 break # Exit loop immediately
             except Exception as e:
                 # Catch other errors from MCPClient init or list_tools
-                logger.exception(f'Unexpected error managing connection for {name}. Retrying...', server_name=name, url=url)
+                logger.exception(f'Unexpected error managing connection for {name}. Retrying…', server_name=name, url=url)
                 # Optionally log traceback: logger.error("Traceback:", exc_info=True)
 
             # 5. Cleanup before Reconnect/Shutdown
@@ -250,7 +250,7 @@ class MCPCog(commands.Cog):
         '''
         Set up MCP connections when the cog is loaded by starting persistent tasks.
         '''
-        logger.info('Loading MCPCog and starting connection managers...')
+        logger.info('Loading MCPCog and starting connection managers…')
         self._shutdown_event.clear() # Ensure shutdown is not set initially
         mcp_servers = self.config.get('mcp', {}).get('server', [])
         if not mcp_servers:
@@ -285,13 +285,13 @@ class MCPCog(commands.Cog):
         '''
         Clean up MCP connections when the cog is unloaded by stopping tasks.
         '''
-        logger.info('Unloading MCPCog and stopping connection tasks...')
+        logger.info('Unloading MCPCog and stopping connection tasks…')
         self._shutdown_event.set() # Signal all tasks to stop their loops
 
         tasks_to_wait_for = list(self._connection_tasks.values())
 
         if tasks_to_wait_for:
-            logger.info(f'Waiting for {len(tasks_to_wait_for)} MCP connection tasks to complete shutdown...')
+            logger.info(f'Waiting for {len(tasks_to_wait_for)} MCP connection tasks to complete shutdown…')
             # Wait for tasks to finish processing the shutdown signal
             # Give them a bit more time as they might be in a wait/retry loop
             done, pending = await asyncio.wait(tasks_to_wait_for, timeout=15.0)
@@ -833,7 +833,7 @@ class MCPCog(commands.Cog):
                  status_icon = '🟡'
              elif name in self._connection_tasks and not self._connection_tasks[name].done():
                  # Task is running but not successfully connected/listed tools yet
-                 status = 'Connecting / Initializing...'
+                 status = 'Connecting / Initializing…'
                  status_icon = '🟠'
              elif name in configured_servers:
                   # Configured but no active connection or task running (or task finished with error)
@@ -858,11 +858,11 @@ class MCPCog(commands.Cog):
                           tool_name = tool.name or f'Unnamed Tool {i+1}'
                           if displayed_count < tool_limit:
                               desc = tool.description or 'No description'
-                              message += f'    - `{tool_name}`: {desc[:100]}{"..." if len(desc)>100 else ""}\n'
+                              message += f'    - `{tool_name}`: {desc[:100]}{"…" if len(desc)>100 else ""}\n'
                               displayed_count += 1
                           elif displayed_count == tool_limit:
                               remaining = len(tools) - tool_limit
-                              if remaining > 0: message += f'    - ... and {remaining} more\n'
+                              if remaining > 0: message += f'    - … and {remaining} more\n'
                               break # Stop listing tools for this server
                  else:
                      # This case means list_tools succeeded but returned an empty list

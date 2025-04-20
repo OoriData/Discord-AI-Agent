@@ -1,5 +1,4 @@
 # toy_mcp_server.py
-#!/usr/bin/env python
 '''
 A simple toy MCP server for testing MCP clients.
 Provides basic tools like add, echo, and a simulated long task.
@@ -31,7 +30,7 @@ TOY_SERVER_VERSION = '0.0.1'
 TOY_SERVER_DESCRIPTION = 'A simple MCP server with basic tools for testing'
 
 
-# 1. Initialize FastMCP
+# Initialize FastMCP
 #    - name, version, description are used for MCP discovery
 #    - context can hold shared state, not needed for this simple example
 #    - auto_mount=False means we'll mount the SSE app manually later
@@ -42,11 +41,6 @@ mcp = FastMCP(
     context={}, # No shared context needed for these tools
     auto_mount=False
 )
-
-# 2. Define Simple MCP Tools
-#    - Use the @mcp.tool() decorator
-#    - Functions should be async
-#    - Type hints are recommended
 
 @mcp.tool()
 async def add(a: int, b: int) -> int:
@@ -83,8 +77,8 @@ async def error_tool(message: str = 'This is a simulated error') -> None:
     logger.info('Executing `error_tool`', message=message)
     raise ValueError(message)
 
-# 3. Define Resource Handlers (Optional for simple tools, but good practice)
-#    You could add resource handlers here if needed, similar to your gdrive example.
+# Define Resource Handlers (Optional for simple tools, but good practice)
+#    Could add resource handlers here if needed, similar to your gdrive example.
 #    For this toy server, we'll skip them to keep it minimal.
 
 # @mcp.resource('toy://items/{cursor}/{page_size}')
@@ -97,7 +91,7 @@ async def error_tool(message: str = 'This is a simulated error') -> None:
 #     # Implementation to read a dummy resource
 #     pass
 
-# 4. Create the FastAPI App Factory
+# FastAPI App Factory
 def create_app() -> FastAPI:
     '''Factory function for Uvicorn to create the FastAPI app.'''
     logger.info('Creating Toy FastAPI app instance via factory.')
@@ -138,18 +132,19 @@ def create_app() -> FastAPI:
     logger.info('Toy FastAPI app created with MCP routes mounted.')
     return app
 
-# 5. Add a main block for direct execution (optional)
+DEFAULT_PORT = 8901
+
+# Default main block for direct execution (optional)
 if __name__ == '__main__':
-    # This allows running the server directly using: python toy_server.py
-    # It's often better to use Uvicorn directly for production/testing,
-    # but this can be convenient for quick checks.
-    print('Starting server directly using uvicorn.run()...')
-    print('For standard execution, use:')
-    print('uvicorn toy_server:create_app --factory --host 127.0.0.1 --port 8901')
+    # Allows running the server directly using: python toy_server.py, but not recommended beyond quick checks
+    # Instead use Uvicorn
+    logger.info('Starting server directly using uvicorn.run()…')
+    logger.info('For standard execution, use:')
+    logger.info(f'uvicorn toy_server:create_app --factory --host 127.0.0.1 --port {DEFAULT_PORT}')
     uvicorn.run(
-        'toy_server:create_app', # Point to the factory function string
+        'toy_server:create_app', # Factory function string
         host='127.0.0.1',
-        port=8901,
-        factory=True, # Tell uvicorn to use the factory
-        reload=True   # Enable auto-reload for development
+        port=DEFAULT_PORT,
+        factory=True,
+        reload=True
         )

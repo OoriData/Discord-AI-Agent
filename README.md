@@ -15,6 +15,7 @@ Then edit `myconfig.toml` as needed. It specifies your LLM endpoint and MCP serv
 # Running
 
 ```sh
+# Assumes you've exported DISCORD_TOKEN="YOUR_TOKEN" 
 python mcp_discord_bot.py --discord-token $DISCORD_TOKEN --config-path myconfig.toml
 ```
 
@@ -23,12 +24,15 @@ Structlog/rich tracebacks can be elaborate, so there is a `--classic-tracebacks`
 Note: you can use the environment rather than `--discord-token` & `--config-path`
 
 ```sh
-export MCP_DISCORD_DISCORD_TOKEN="YOUR_TOKEN"
+export MCP_DISCORD_TOKEN="YOUR_TOKEN"
 export MCP_DISCORD_CONFIG_PATH="./config.toml"
 python mcp_discord_bot.py # Reads from env vars
 ```
 
-There's an `MCP_DEBUG=1` variable from upstream, but I'm not entirely sure what it shows.
+# Implementation notes
+
+* [discord.py](https://github.com/Rapptz/discord.py)
+* [mcp-sse-client](https://github.com/zanetworker/mcp-sse-client-python) MCP client library
 
 # Checking MCP servers
 

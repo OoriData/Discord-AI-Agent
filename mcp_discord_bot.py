@@ -76,8 +76,6 @@ def setup_logging(classic_tracebacks: bool = False): # Keep the argument, but ig
     # logging.getLogger("httpx").setLevel(logging.WARNING)
     # logging.getLogger("anyio").setLevel(logging.WARNING)
 
-# --- rest of mcp_discord_bot.py remains the same ---
-
 def load_config(config_path: str):
     '''Loads and validates the TOML configuration file.'''
     if not config_path:
@@ -141,12 +139,12 @@ def main(
 
     # Argument Handling (including environment variables as fallback)
     if not discord_token:
-        discord_token = os.environ.get('MCP_DISCORD_DISCORD_TOKEN')
+        discord_token = os.environ.get('MCP_DISCORD_TOKEN')
         if not discord_token:
              logger.critical('Discord token must be provided via --discord-token or MCP_DISCORD_DISCORD_TOKEN env var.')
              sys.exit(1)
         else:
-             logger.info('Using Discord token from MCP_DISCORD_DISCORD_TOKEN environment variable.')
+             logger.info('Using Discord token from MCP_DISCORD_TOKEN environment variable.')
 
     if not config_path:
         config_path = os.environ.get('MCP_DISCORD_CONFIG_PATH')
@@ -163,7 +161,7 @@ def main(
         logger.critical('Failed to load configuration. Exiting.')
         sys.exit(1) # Exit if config fails
 
-    logger.info('Setting up Discord bot intents...')
+    logger.info('Setting up Discord bot intents…')
     intents = discord.Intents.default()
     intents.message_content = True
     intents.members = True # Ensure members intent is enabled in Discord Dev Portal too
@@ -174,7 +172,7 @@ def main(
     bot = commands.Bot(command_prefix=['!'], intents=intents, description='MCP Discord Bot')
 
     # Create Cog instance
-    logger.info('Initializing MCPCog...')
+    logger.info('Initializing MCPCog…')
     try:
         mcp_cog = MCPCog(bot, config)
     except Exception as e:
@@ -184,18 +182,18 @@ def main(
 
     # Define async setup function (called by setup_hook)
     async def setup_bot():
-        logger.info('Adding MCPCog to bot...')
+        logger.info('Adding MCPCog to bot…')
         await bot.add_cog(mcp_cog)
         logger.info('MCP Cog added successfully')
 
     # Use setup_hook for async setup actions like adding cogs and syncing commands
     @bot.event
     async def setup_hook():
-        logger.info('Executing setup_hook...')
+        logger.info('Executing setup_hook…')
         await setup_bot()
-        logger.info('Syncing application commands...')
+        logger.info('Syncing application commands…')
         try:
-            # Sync commands globally. Specify guild=discord.Object(id=...) for faster testing sync.
+            # Sync commands globally. Specify guild=discord.Object(id=…) for faster testing sync.
             # guild_id = os.environ.get('DISCORD_DEV_GUILD_ID') # Example for guild-specific sync
             # if guild_id:
             #    guild = discord.Object(id=int(guild_id))
@@ -218,7 +216,7 @@ def main(
         # await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="!chat or /chat"))
 
 
-    logger.info('Starting bot...')
+    logger.info('Starting bot…')
     try:
         # Disable default discord.py logging handler if using structlog fully
         # Set log_handler=None if you want structlog to be the *only* handler.
