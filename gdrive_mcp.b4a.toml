@@ -1,0 +1,24 @@
+# google_mcp.b4a.toml
+# Describes connecting to an MCP Server that provides Google Drive tools.
+# This delegates the complexity of GDrive API interaction and OAuth to the MCP server.
+
+[[tool_source]]
+name = "google_drive_via_mcp"
+description = "Access Google Drive files and features via the central MCP Server"
+type = ".mcp" # REQUIRED: Specifies the integration handler type.
+
+# Configuration specific to the '.mcp' handler:
+connection_method = "sse" # REQUIRED: How to communicate (e.g., 'sse', 'stdio').
+url = "http://localhost:8080/mcp" # REQUIRED: Endpoint for the MCP Server (SSE example).
+# Or for stdio:
+# connection_method = "stdio"
+# command = ["python", "path/to/mcp_server_script.py"]
+
+# Optional: Authentication required *by this specific MCP server itself*.
+# The mechanism depends on the '.mcp' handler's supported auth types.
+# Example using a hypothetical API key scheme for the MCP server connection:
+# [tool_source.auth]
+# type = ".apikey"
+# description = "API Key authentication for the MCP Server"
+# header_name = "X-MCP-Secret" # Example header
+# key_env = "MCP_SERVER_SECRET" # REQUIRED: Env var holding the secret.

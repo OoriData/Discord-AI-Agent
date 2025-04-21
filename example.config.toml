@@ -1,8 +1,9 @@
-[mcp]
+[b4a] # Config for e.g. tools & resources, perhaps via MCP
 
-[[server]]  # MCP server configurations
-name = "mcp-gdrive-local"
-url = "http://localhost:8900"
+sources = [
+  "gdrive_mcp.b4a.toml",
+  "news.b4a.toml"
+]
 
 [llm_endpoint]
 base_url = "http://localhost:1234/v1"

@@ -19,6 +19,7 @@ from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageToolCa
 from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceDelta
 
 from mcp_sse_client import MCPClient, ToolDef, ToolInvocationResult, ToolParameter # Added
+from b4a_config import B4ALoader, MCPConfig, RSSConfig, resolve_value
 
 # Needed for ClosedResourceError/BrokenResourceError handling if not imported via sse/mcp
 # MCPClient might raise its own connection errors or underlying httpx/anyio errors
@@ -113,92 +114,87 @@ async def send_long_message(sendable: Union[commands.Context, discord.Interactio
 
 
 class MCPCog(commands.Cog):
-    def __init__(self, bot: commands.Bot, config: Dict[str, Any]):
+    def __init__(self, bot: commands.Bot, main_config: Dict[str, Any], b4a_data: B4ALoader):
         self.bot = bot
-        self.config = config
-        # Store live MCPClient objects, keyed by server name
-        self.mcp_connections: Dict[str, MCPClient] = {}
-        # Store ToolDef objects keyed by server name -> tool name for faster lookup?
-        # Or keep as list per server? List is simpler for format_tools_for_openai
-        self.mcp_tools: Dict[str, List[ToolDef]] = {} # Store ToolDef objects
+        self.main_config = main_config # Main agent config (LLM, etc.)
+        self.b4a_data = b4a_data     # Loaded B4A source data
+        self.mcp_connections: Dict[str, MCPClient] = {} # Keyed by MCPConfig.name
+        self.mcp_tools: Dict[str, List[ToolDef]] = {} # Keyed by MCPConfig.name
         self.message_history: Dict[int, List[Dict[str, Any]]] = {}
 
         self._connection_tasks: Dict[str, asyncio.Task] = {}
         self._shutdown_event = asyncio.Event()
 
-        # LLM Client Initialization
-        llm_init_params = {k: v for k, v in config.get('llm_endpoint', {}).items() if k in ALLOWED_FOR_LLM_INIT}
-        llm_endpoint_config = config.get('llm_endpoint', {}) # Get the whole section
+        # LLM Client and Parameter Initialization
+        llm_endpoint_config = self.main_config.get('llm_endpoint', {})
+        model_params_config = self.main_config.get('model_params', {})
 
-        if not llm_endpoint_config:
-            logger.error('LLM endpoint configuration ("llm_endpoint") missing!')
-            raise ValueError('LLM endpoint configuration missing.')
-
-        # Ensure API key is present (from config or env var handled in load_config)
-        if 'api_key' not in llm_init_params:
-             llm_init_params['api_key'] = llm_endpoint_config.get('api_key', 'missing-key') # Should be set by load_config
-             if llm_init_params['api_key'] == 'missing-key':
-                  logger.warning("LLM API Key not found in config or OPENAI_API_KEY env var.")
+        # Initialize LLM Client
+        llm_init_params = {k: resolve_value(v) for k, v in llm_endpoint_config.items() if k in ALLOWED_FOR_LLM_INIT}
+        if 'api_key' not in llm_init_params: llm_init_params['api_key'] = 'missing-key' # Or handle error
+        if not llm_init_params.get('base_url'):
+            raise ValueError('LLM \'base_url\' is required.')
 
         try:
             self.llm_client = AsyncOpenAI(**llm_init_params)
-            logger.info("AsyncOpenAI client initialized.", base_url=llm_init_params.get('base_url'))
+            logger.info('AsyncOpenAI client initialized.', **llm_init_params)
         except Exception as e:
-            logger.exception('Failed to initialize OpenAI client', endpoint_config=llm_endpoint_config)
+            logger.exception('Failed to initialize OpenAI client', config=llm_init_params)
             raise e
 
-        # LLM Chat Parameters (defaults + overrides from config)
-        self.llm_chat_params = { # Start with reasonable defaults
-             'model': 'local-model',
-             'temperature': 0.3,
+        # Configure LLM Chat Parameters (Combine defaults, model_params, llm_endpoint)
+        self.llm_chat_params = {
+             'model': llm_endpoint_config.get('label', 'local-model'), # Default model name
+             'temperature': 0.3, 'max_tokens': 1000, # Base defaults
         }
-        # Update with allowed chat params from the llm_endpoint config section
-        endpoint_chat_params = {k: v for k, v in llm_endpoint_config.items() if k in ALLOWED_FOR_LLM_CHAT}
-        self.llm_chat_params.update(endpoint_chat_params)
+        # Apply overrides from [model_params] first
+        model_param_overrides = {k: resolve_value(v) for k, v in model_params_config.items() if k in ALLOWED_FOR_LLM_CHAT}
+        self.llm_chat_params.update(model_param_overrides)
+        # Apply any *other* allowed chat params found in [llm_endpoint]
+        endpoint_chat_overrides = {k: resolve_value(v) for k, v in llm_endpoint_config.items() if k in ALLOWED_FOR_LLM_CHAT and k not in model_param_overrides}
+        self.llm_chat_params.update(endpoint_chat_overrides)
+        logger.info('LLM chat parameters configured', **self.llm_chat_params)
 
-        # LLM Settings from dedicated section (overrides endpoint params if keys overlap)
-        # DEPRECATED: Merged into llm_chat_params for simplicity. Keeping structure in case needed.
-        # self.llm_settings = config.get('llm_settings', {})
-        # self.llm_settings.setdefault('model', self.llm_chat_params['model'])
-        # self.llm_settings.setdefault('temperature', self.llm_chat_params.get('temperature', 0.3))
-        # self.llm_chat_params.update(self.llm_settings) # Apply overrides
+        # Configure System Message
+        sysmsg = resolve_value(llm_endpoint_config.get('sysmsg', 'You are a helpful AI assistant.'))
+        sys_postscript = resolve_value(llm_endpoint_config.get('sys_postscript', ''))
+        self.system_message = sysmsg + ('\n\n' + sys_postscript if sys_postscript else '')
+        logger.info('System message configured.', sysmsg_len=len(sysmsg), postscript_len=len(sys_postscript))
+        logger.debug(f'Full system message: {self.system_message}') # Debug level for full message
 
-        logger.info("LLM chat parameters configured", **self.llm_chat_params)
+        # Log B4A Loading Summary
+        if self.b4a_data.load_errors:
+            logger.warning('Errors occurred during B4A source loading.', count=len(self.b4a_data.load_errors), errors=self.b4a_data.load_errors)
+        logger.info('MCP Cog initialized.', mcp_sources_found=len(self.b4a_data.mcp_sources), rss_sources_found=len(self.b4a_data.rss_sources))
 
-
-        self.system_message = config.get('system_message', 'You are a helpful AI assistant. You can access tools using MCP servers.')
-        logger.info('MCPCog initialized.')
-
-    async def _manage_mcp_connection(self, url: str, name: str):
+    async def _manage_mcp_connection(self, mcp_config: MCPConfig):
         '''Persistent task to manage a single MCP connection using MCPClient.'''
+        url = mcp_config.url
+        name = mcp_config.name # Use the name from B4A config
         reconnect_delay = 15 # Initial delay seconds
         max_reconnect_delay = 300 # Max delay seconds
 
         while not self._shutdown_event.is_set():
-            logger.info(f'Attempting to connect/verify MCP server: {name}', url=url)
+            logger.info(f'Attempting connection for MCP source: \'{name}\'', url=url)
             client: Optional[MCPClient] = None
             try:
-                # 1. Create or Get Client Instance
-                # MCPClient constructor likely attempts initial connection/handshake.
-                # It might raise errors here if the initial connection fails.
-                client = MCPClient(url) # Add headers/timeouts from config if needed
-                logger.info(f'MCPClient instance created for {name}. Attempting to list tools…')
+                # TODO: Add auth handling here based on mcp_config fields if needed
+                client = MCPClient(url)
+                logger.info(f'MCPClient instance created for \'{name}\'. Listing tools…')
 
-                # 2. List Tools (Acts as connection check and fetches tool info)
-                # This call will likely handle the underlying SSE connection setup and MCP handshake implicitly.
-                # Add timeout? MCPClient might have internal timeouts. Check its docs/code.
-                # Let's add a reasonable application-level timeout for list_tools.
+                # List Tools acts as connection check & fetches tool info
+                # Will likely handle the underlying SSE connection setup and MCP handshake implicitly
+                # Add timeout? Check whether MCPClient handles that, but add ours, for now
                 tools_list: List[ToolDef] = await asyncio.wait_for(client.list_tools(), timeout=45.0)
 
-                # 3. Store Client and Tools on Success
                 self.mcp_connections[name] = client
                 self.mcp_tools[name] = tools_list
-                logger.info(f'Successfully connected to {name} and listed {len(tools_list)} tools.', server_name=name)
+                logger.info(f'Connected to MCP source \'{name}\' and listed {len(tools_list)} tools.', server_name=name)
                 reconnect_delay = 15 # Reset delay on success
 
-                # 4. Connection Maintenance (MCPClient handles underlying keep-alive/SSE)
-                # We just need to wait until shutdown or an error occurs during a tool call.
-                # This task can potentially sleep or periodically check status if MCPClient provides a method.
+                # Connection Maintenance (MCPClient handles underlying keep-alive/SSE)
+                # Just need to wait until shutdown or an error occurs during a tool call.
+                # Task can potentially sleep or periodically check status if MCPClient provides a method.
                 # For now, rely on execute_tool to detect issues. Wait for shutdown signal.
                 await self._shutdown_event.wait()
                 logger.info(f'Shutdown signal received for {name}. Ending management task.')
@@ -216,7 +212,7 @@ class MCPCog(commands.Cog):
                 logger.exception(f'Unexpected error managing connection for {name}. Retrying…', server_name=name, url=url)
                 # Optionally log traceback: logger.error("Traceback:", exc_info=True)
 
-            # 5. Cleanup before Reconnect/Shutdown
+            # Cleanup before Reconnect/Shutdown
             logger.debug(f'Cleaning up resources for {name} before retry/shutdown.')
             if name in self.mcp_connections:
                 # Does MCPClient need explicit closing? Check its implementation.
@@ -224,9 +220,9 @@ class MCPCog(commands.Cog):
                 del self.mcp_connections[name]
             if name in self.mcp_tools:
                 del self.mcp_tools[name]
-            client = None # Ensure client object is cleared
+            client = None  # Ensure client object is cleared
 
-            # 6. Wait before Retrying (if not shutting down)
+            # Wait before Retrying (if not shutting down)
             if not self._shutdown_event.is_set():
                 logger.info(f'Waiting {reconnect_delay}s before reconnecting to {name}.')
                 try:
@@ -243,7 +239,6 @@ class MCPCog(commands.Cog):
         logger.info(f'Connection management task for {name} finished cleanly.')
         if name in self.mcp_connections: del self.mcp_connections[name]
         if name in self.mcp_tools: del self.mcp_tools[name]
-        # Ensure client is None
         client = None
 
     async def cog_load(self):
@@ -252,32 +247,24 @@ class MCPCog(commands.Cog):
         '''
         logger.info('Loading MCPCog and starting connection managers…')
         self._shutdown_event.clear() # Ensure shutdown is not set initially
-        mcp_servers = self.config.get('mcp', {}).get('server', [])
-        if not mcp_servers:
-            logger.warning('No MCP servers defined in configuration.')
+
+        mcp_source_configs = self.b4a_data.mcp_sources # Get sources from B4A data
+        if not mcp_source_configs:
+            logger.warning('No valid @mcp B4A sources loaded. No MCP connections will be established.')
             return
 
         active_task_count = 0
-        for server in mcp_servers:
-            # Basic validation of server config entry
-            if isinstance(server, dict) and 'url' in server and 'name' in server:
-                name = server['name']
-                url = server['url']
-                if not isinstance(name, str) or not isinstance(url, str):
-                     logger.warning('Invalid MCP server config entry, name/url not strings', entry=server)
-                     continue
-
-                # Start task only if it doesn't exist or has finished
-                if name not in self._connection_tasks or self._connection_tasks[name].done():
-                    logger.info(f'Creating connection task for MCP server: {name}')
-                    task = asyncio.create_task(self._manage_mcp_connection(url, name), name=f'mcp_conn_{name}')
-                    self._connection_tasks[name] = task
-                    active_task_count += 1
-                else:
-                    logger.info(f'Connection task for {name} already running.')
-                    active_task_count += 1 # Count existing running tasks too
+        for mcp_conf in mcp_source_configs: # Iterate B4A sources
+            name = mcp_conf.name
+            if name not in self._connection_tasks or self._connection_tasks[name].done():
+                logger.info(f'Creating connection task for B4A MCP source: \'{name}\'', url=mcp_conf.url)
+                # Pass the MCPConfig object
+                task = asyncio.create_task(self._manage_mcp_connection(mcp_conf), name=f'mcp_conn_{name}')
+                self._connection_tasks[name] = task
+                active_task_count += 1
             else:
-                 logger.warning('Invalid MCP server config entry, missing "url" or "name"', entry=server)
+                logger.info(f'Connection task for B4A MCP source \'{name}\' already running.')
+                active_task_count += 1
 
         logger.info(f'MCPCog load processed. {active_task_count} connection tasks are active or starting.')
 
@@ -331,43 +318,29 @@ class MCPCog(commands.Cog):
         logger.debug('Executing tool', tool_name=tool_name, tool_input=tool_input)
 
         mcp_client: Optional[MCPClient] = None
-        server_name_found: Optional[str] = None
+        server_name_found: Optional[str] = None  # B4A source name
 
-        # Find the server/client that has the tool listed
-        for server_name, client in self.mcp_connections.items():
+        # Find the server/client (keyed by B4A source name) that has the tool
+        for source_name, client in self.mcp_connections.items():
             # Check if the tool name exists in the list of tools for this server
-            if server_name in self.mcp_tools and any(tool.name == tool_name for tool in self.mcp_tools[server_name]):
+            if source_name in self.mcp_tools and any(tool.name == tool_name for tool in self.mcp_tools[source_name]):
                 mcp_client = client
-                server_name_found = server_name
-                logger.debug(f"Found active client for tool '{tool_name}' on server '{server_name}'.")
+                server_name_found = source_name
+                logger.debug(f'Found active client for tool \'{tool_name}\' on MCP source \'{server_name_found}\'.')
                 break
 
         if not mcp_client or not server_name_found:
-            logger.warning(f'Tool "{tool_name}" not found on any *actively connected* MCP server.')
-            # Provide more specific error messages
+            logger.warning(f'Tool \'{tool_name}\' not found on any *actively connected* MCP source.')
+            # Provide more specific error based on B4A data
+            if not self.b4a_data.mcp_sources:
+                return {'error': f'Tool \'{tool_name}\' cannot be executed: No @mcp B4A sources configured.'}
             if not self.mcp_connections:
-                return {'error': f'Tool "{tool_name}" cannot be executed: No MCP servers currently connected.'}
-            else:
-                # Check if the tool *exists* in config but server is down
-                 tool_server_origin = None
-                 for s_name, tools in self.mcp_tools.items(): # Check loaded tools first
-                     if any(t.name == tool_name for t in tools):
-                         tool_server_origin = s_name
-                         break
-                 # If not found in loaded tools, check config (less reliable state)
-                 if not tool_server_origin:
-                     for server_config in self.config.get('mcp', {}).get('server', []):
-                          s_name = server_config.get('name')
-                          # This check requires knowing tools without connection - less ideal.
-                          # Relying on self.mcp_tools (populated on connection) is better.
-                          pass # Can't reliably check config without prior connection
-
-                 if tool_server_origin and tool_server_origin not in self.mcp_connections:
-                      return {'error': f'Tool "{tool_name}" exists (on server "{tool_server_origin}"), but the server is currently disconnected or unavailable.'}
-                 elif tool_server_origin: # Exists and server *is* in connections, but wasn't selected? Should not happen.
-                     return {'error': f'Internal state error: Tool "{tool_name}" found but client mismatch.'}
-                 else:
-                     return {'error': f'Tool "{tool_name}" not found on any configured and connected MCP server.'}
+                return {'error': f'Tool \'{tool_name}\' cannot be executed: No MCP sources currently connected.'}
+            # Check if tool exists on a configured but disconnected source
+            origin_source = next((s.name for s in self.b4a_data.mcp_sources if s.name in self.mcp_tools and any(t.name == tool_name for t in self.mcp_tools[s.name])), None)
+            if origin_source and origin_source not in self.mcp_connections:
+                return {'error': f'Tool \'{tool_name}\' exists (on MCP source \'{origin_source}\'), but it\'s currently disconnected.'}
+            return {'error': f'Tool \'{tool_name}\' not found on any configured and connected MCP source.'}
 
         logger.info(f'Calling tool "{tool_name}" on MCP server "{server_name_found}"')
         try:
@@ -682,9 +655,11 @@ class MCPCog(commands.Cog):
                 for tool_call in tool_calls_aggregated:
                     # Basic validation of structure remains useful
                     if not isinstance(tool_call, dict) or 'function' not in tool_call or 'id' not in tool_call:
-                         logger.error('Malformed tool call structure received from LLM', tool_call_data=tool_call); continue
+                         logger.error('Malformed tool call structure received from LLM', tool_call_data=tool_call)
+                         continue
                     if not isinstance(tool_call['function'], dict) or 'name' not in tool_call['function'] or 'arguments' not in tool_call['function']:
-                         logger.error('Malformed tool call function structure received from LLM', tool_call_data=tool_call); continue
+                         logger.error('Malformed tool call function structure received from LLM', tool_call_data=tool_call)
+                         continue
 
                     tool_name = tool_call['function']['name']
                     tool_call_id = tool_call['id']
@@ -786,92 +761,61 @@ class MCPCog(commands.Cog):
         ''' Cog ready listener. Connection tasks are started in cog_load. '''
         logger.info(f'Cog {self.__class__.__name__} is ready.')
 
+    @app_commands.command(name='context_info', description='List configured B4A (model context) sources and their status')
+    async def context_info_slash(self, interaction: discord.Interaction):
+        ''' Command to list configured B4A sources and MCP connection status. '''
+        logger.info(f'Command \'/context_info\' invoked by {interaction.user}')
+        await interaction.response.defer(thinking=True, ephemeral=False)
 
-    @app_commands.command(name='mcp_list', description='List connected MCP servers and available tools')
-    async def mcp_list_slash(self, interaction: discord.Interaction):
-        ''' Command to list connected MCP servers and tools. '''
-        logger.info(f'Command "/mcp_list" invoked by {interaction.user} in channel {interaction.channel_id}')
-        await interaction.response.defer(thinking=True, ephemeral=False) # Non-ephemeral thinking
+        message = '**B4A Sources Status:**\n\n'
 
-        # Check status based on new connection management
-        if not self.mcp_connections and not self.mcp_tools:
-            if not self._connection_tasks:
-                 await interaction.followup.send('No MCP servers are configured.')
+        # MCP Sources
+        message += f'**MCP Sources (.mcp): {len(self.b4a_data.mcp_sources)} configured**\n'
+        if not self.b4a_data.mcp_sources: message += '  *None configured or loaded.*\n'
+        for mcp_conf in self.b4a_data.mcp_sources:
+            name = mcp_conf.name
+            status_icon = '❓'
+            status_text = 'Unknown'
+            if name in self.mcp_connections and name in self.mcp_tools:
+                 status_icon = '🟢'; status_text = f'Connected ({len(self.mcp_tools[name])} tools)'
+            elif name in self.mcp_connections:
+                status_icon = '🟡'; status_text = 'Connected (Tool list issue?)'
+            elif name in self._connection_tasks and not self._connection_tasks[name].done():
+                status_icon = '🟠'; status_text = 'Connecting…'
             else:
-                 # Check if tasks are running but haven't connected yet
-                 all_tasks_done = all(t.done() for t in self._connection_tasks.values())
-                 if all_tasks_done:
-                      await interaction.followup.send('MCP servers are configured, but none are currently connected. Check server status and bot logs.')
-                 else:
-                      await interaction.followup.send('MCP servers are configured and attempting to connect/reconnect. Please wait a moment and try again.')
-            return
+                status_icon = '🔴'; status_text = 'Disconnected / Failed' # Assumes task finished if not connecting
+            message += f'- **{name}**: {status_icon} {status_text} ({mcp_conf.url})\n'
+        message += '\n'
 
-        message = '**MCP Server Status & Tools:**\n\n'
-        # Get server names from config and current state
-        configured_servers = {s['name'] for s in self.config.get('mcp', {}).get('server', []) if 'name' in s}
-        connected_servers = set(self.mcp_connections.keys()) # Servers with active MCPClient
-        servers_with_tools = set(self.mcp_tools.keys()) # Servers where list_tools succeeded
+        # RSS Sources
+        message += f'**RSS Sources (.rss): {len(self.b4a_data.rss_sources)} configured**\n'
+        if not self.b4a_data.rss_sources:
+            message += '  *None configured or loaded.*\n'
+        for rss_conf in self.b4a_data.rss_sources:
+             status_icon = '⚪' # Not actively managed by this cog yet
+             status_text = 'Loaded (Not Active)'
+             # TODO: Add logic here if RSS feeds become actively managed (e.g., fetch status)
+             message += f'- **{rss_conf.name}**: {status_icon} {status_text} ({rss_conf.url})\n'
+        message += '\n'
 
-        # Consider all servers mentioned in config or currently tracked
-        all_server_names = configured_servers.union(connected_servers).union(servers_with_tools)
+        # Unhandled Sources
+        if self.b4a_data.unhandled_sources:
+            message += f'**Unhandled Sources: {len(self.b4a_data.unhandled_sources)} found**\n'
+            for src in self.b4a_data.unhandled_sources:
+                 name = src.get('_sourcename', 'Unknown Name')
+                 type = src.get('type', 'Unknown Type')
+                 reason = src.get('_reason', 'No handler')
+                 message += f'- **{name}**: ⚠️ Type \'{type}\' - {reason}\n'
+            message += '\n'
 
-        if not all_server_names:
-             await interaction.followup.send('No MCP servers found in configuration or current state.')
-             return
+        # Loading Errors
+        if self.b4a_data.load_errors:
+             message += f'**Loading Errors: {len(self.b4a_data.load_errors)} encountered**\n'
+             for path, err in self.b4a_data.load_errors[:5]: # Show first 5 errors
+                 message += f'- `{os.path.basename(path)}`: {err[:150]}…\n'
+             if len(self.b4a_data.load_errors) > 5: message += '- … (see logs for more details)\n'
 
-        for name in sorted(list(all_server_names)):
-             status = ''
-             status_icon = '❓' # Unknown/Default
-
-             # Determine status based on connections, tools, and tasks
-             if name in connected_servers and name in servers_with_tools:
-                 status = 'Connected & Tools Listed'
-                 status_icon = '🟢'
-             elif name in connected_servers and name not in servers_with_tools:
-                 # This state might occur briefly if list_tools failed after MCPClient init
-                 status = 'Connected (Listing Tools Failed?)'
-                 status_icon = '🟡'
-             elif name in self._connection_tasks and not self._connection_tasks[name].done():
-                 # Task is running but not successfully connected/listed tools yet
-                 status = 'Connecting / Initializing…'
-                 status_icon = '🟠'
-             elif name in configured_servers:
-                  # Configured but no active connection or task running (or task finished with error)
-                  status = 'Disconnected / Unavailable'
-                  status_icon = '🔴'
-             else:
-                  # Should not happen if logic is correct (name exists but not in config/tasks)
-                  status = 'Unknown State (Stale Data?)'
-                  status_icon = '⚪'
-
-
-             message += f'- **{name}**: {status_icon} {status}\n'
-
-             # List tools only if successfully listed
-             if name in servers_with_tools:
-                 tools: List[ToolDef] = self.mcp_tools[name]
-                 if tools:
-                     message += f'  **Tools ({len(tools)}):**\n'
-                     tool_limit = 7
-                     displayed_count = 0
-                     for i, tool in enumerate(tools):
-                          tool_name = tool.name or f'Unnamed Tool {i+1}'
-                          if displayed_count < tool_limit:
-                              desc = tool.description or 'No description'
-                              message += f'    - `{tool_name}`: {desc[:100]}{"…" if len(desc)>100 else ""}\n'
-                              displayed_count += 1
-                          elif displayed_count == tool_limit:
-                              remaining = len(tools) - tool_limit
-                              if remaining > 0: message += f'    - … and {remaining} more\n'
-                              break # Stop listing tools for this server
-                 else:
-                     # This case means list_tools succeeded but returned an empty list
-                     message += '  *Connected, but server reported no tools.*\n'
-
-             message += '\n' # Space between servers
-
-        await send_long_message(interaction, message.strip(), followup=True)
-
+        await send_long_message(interaction, message.strip() or 'No B4A sources found or configured.', followup=True)
 
     # Chat Commands (Prefix and Slash)
     # These commands use _handle_chat_logic, so changes there are inherited.
