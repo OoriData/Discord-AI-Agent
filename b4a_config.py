@@ -6,10 +6,11 @@ handlers to prepare configurations for different integrations (MCP, RSS, etc.).
 '''
 import os
 import tomllib
-from typing import List, Dict, Any, Optional, Tuple, Union
+from typing import Any, Optional, Union
 import structlog
 import re
-import dataclasses # Using dataclasses for structured config
+import dataclasses
+from pathlib import Path
 
 logger = structlog.get_logger(__name__)
 
@@ -63,13 +64,13 @@ class B4ALoader:
     '''Loads and processes B4A configuration sources.'''
     def __init__(self):
         # Store results keyed by type
-        self.mcp_sources: List[MCPConfig] = []
-        self.rss_sources: List[RSSConfig] = []
+        self.mcp_sources: list[MCPConfig] = []
+        self.rss_sources: list[RSSConfig] = []
         # Add lists for other source types as handlers are implemented
-        self.unhandled_sources: List[Dict[str, Any]] = []
-        self.load_errors: List[Tuple[str, str]] = [] # (filepath, error_message)
+        self.unhandled_sources: list[dict[str, Any]] = []
+        self.load_errors: list[tuple[str, str]] = [] # (filepath, error_message)
 
-    def load_and_process_sources(self, main_config: Dict[str, Any], config_dir: str):
+    def load_and_process_sources(self, main_config: dict[str, Any], config_dir: str):
         '''
         Main entry point. Finds source files in main_config, loads, and processes them.
         config_dir: The directory containing the main config file, used for resolving relative paths.
@@ -82,14 +83,14 @@ class B4ALoader:
 
         # Find source file list (assuming [b4a].sources)
         b4a_section = main_config.get('b4a', {})
-        source_files_relative = b4a_section.get('sources', [])
+        source_files_relative = b4a_section.get('source_sets', [])
 
         if not isinstance(source_files_relative, list):
-            logger.error('Main config `[b4a].sources` is not a list. Cannot load B4A sources.', config_sources=source_files_relative)
+            logger.error('Main config `[b4a].source_sets` is not a list. Cannot load B4A sources.', config_sources=source_files_relative)
             return # Cannot proceed
 
         if not source_files_relative:
-            logger.info('No B4A sources listed in `[b4a].sources`.')
+            logger.info('No B4A sources listed in `[b4a].source_sets`.')
             return # Nothing to load
 
         logger.info(f'Found {len(source_files_relative)} B4A source files listed.', sources=source_files_relative)
@@ -101,7 +102,7 @@ class B4ALoader:
                 continue
 
             abs_path = os.path.abspath(os.path.join(config_dir, rel_path))
-            logger.debug(f'Attempting to load B4A source file.', relative_path=rel_path, absolute_path=abs_path)
+            logger.debug('Attempting to load B4A source file', relative_path=rel_path, absolute_path=abs_path)
 
             try:
                 with open(abs_path, 'rb') as fp:
@@ -122,7 +123,10 @@ class B4ALoader:
                 self.load_errors.append((abs_path, err_msg))
                 continue
 
-            self._process_single_source(source_config, abs_path)
+            # Each source set can contain multiple sources
+            for source in source_config.get('context_source', []):
+                logger.debug('Processing B4A context source:', source=source)
+                self._process_single_source(source, abs_path)
 
         logger.info('B4A source loading finished.',
                     mcp_loaded=len(self.mcp_sources),
@@ -130,10 +134,10 @@ class B4ALoader:
                     unhandled=len(self.unhandled_sources),
                     errors=len(self.load_errors))
 
-    def _process_single_source(self, config: Dict[str, Any], filepath: str):
+    def _process_single_source(self, config: dict[str, Any], filepath: str):
         '''Determines the type and calls the appropriate handler.'''
         source_type = config.get('type')
-        source_name = config.get('name', os.path.splitext(os.path.basename(filepath))[0]) # Default name from filename
+        source_name = config.get('name')
 
         if not source_type or not isinstance(source_type, str):
             err_msg = f'B4A source file missing or invalid `type` field.'
@@ -158,7 +162,7 @@ class B4ALoader:
 
     # Type-specific handlers
 
-    def _handle_mcp_source(self, config: Dict[str, Any], name: str, filepath: str):
+    def _handle_mcp_source(self, config: dict[str, Any], name: str, filepath: str):
         '''Handles type = '@mcp' sources.'''
         logger.debug('Handling .mcp source.', name=name, filepath=filepath)
         mcp_url = config.get('url')
@@ -181,7 +185,7 @@ class B4ALoader:
         self.mcp_sources.append(mcp_conf)
         logger.info(f'Successfully processed .mcp source: `{name}`.', url=mcp_url)
 
-    def _handle_rss_source(self, config: Dict[str, Any], name: str, filepath: str):
+    def _handle_rss_source(self, config: dict[str, Any], name: str, filepath: str):
         '''Handles type = '@rss' sources.'''
         logger.debug('Handling .rss source.', name=name, filepath=filepath)
 
@@ -222,7 +226,7 @@ class B4ALoader:
         #     logger.error(f'Error fetching initial data for RSS feed '{name}'.', url=rss_url, error=e)
 
 
-def load_b4a(main_config: Dict[str, Any], config_dir: str) -> B4ALoader:
+def load_b4a(main_config: dict[str, Any], config_dir: Path) -> B4ALoader:
     '''Loads B4A sources based on the main config and returns the loader object.'''
     loader = B4ALoader()
     loader.load_and_process_sources(main_config, config_dir)

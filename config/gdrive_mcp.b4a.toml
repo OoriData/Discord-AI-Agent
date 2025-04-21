@@ -2,7 +2,7 @@
 # Describes connecting to an MCP Server that provides Google Drive tools.
 # This delegates the complexity of GDrive API interaction and OAuth to the MCP server.
 
-[[tool_source]]
+[[context_source]]
 name = "google_drive_via_mcp"
 description = "Access Google Drive files and features via the central MCP Server"
 type = ".mcp" # REQUIRED: Specifies the integration handler type.

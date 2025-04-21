@@ -1,10 +1,10 @@
 # news.b4a.toml
 # Describes a simple direct integration - an RSS feed data source.
 
-[[data_source]] # Can use distinct sections like 'data_source' or 'tool_source'
+[[context_source]]
 name = "example_news_feed"
 description = "Provides latest headlines from Example News"
-type = ".rss" # REQUIRED: Specifies the integration handler type.
+type = "@rss" # REQUIRED: Specifies the integration handler type.
 
 # Configuration specific to the '.rss' handler:
 url = "https://www.example.com/rss/news" # REQUIRED: The URL of the feed.

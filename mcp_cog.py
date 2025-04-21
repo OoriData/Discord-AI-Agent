@@ -6,7 +6,7 @@ and provides commands to interact with MCP tools via an LLM.
 import os
 import json
 import asyncio
-from typing import Dict, Any, List, Union, Optional, Tuple
+from typing import Any, Union, Optional
 import traceback
 
 import discord
@@ -98,13 +98,16 @@ async def send_long_message(sendable: Union[commands.Context, discord.Interactio
              # Try to inform user ephemerally if possible
              error_msg = f'Error sending part of the message (Code: {e.code}). Please check channel permissions or message content.'
              try:
-                 if isinstance(sendable, discord.Interaction):
-                     # Use followup if possible, it's more reliable after potential initial errors
-                     if sendable.response.is_done(): await sendable.followup.send(error_msg, ephemeral=True)
-                     else: await sendable.response.send_message(error_msg, ephemeral=True)
-                 # Context sending is less likely to fail ephemerally
-                 # else: await sendable.send(error_msg) # Avoid sending public errors if interaction failed
-             except Exception: pass # Avoid error loops
+                if isinstance(sendable, discord.Interaction):
+                    # Use followup if possible, it's more reliable after potential initial errors
+                    if sendable.response.is_done():
+                        await sendable.followup.send(error_msg, ephemeral=True)
+                    else:
+                        await sendable.response.send_message(error_msg, ephemeral=True)
+                # Context sending is less likely to fail ephemerally
+                # else: await sendable.send(error_msg) # Avoid sending public errors if interaction failed
+             except Exception:
+                pass # Avoid error loops
              break # Stop sending further chunks on error
 
         start = end
@@ -114,24 +117,25 @@ async def send_long_message(sendable: Union[commands.Context, discord.Interactio
 
 
 class MCPCog(commands.Cog):
-    def __init__(self, bot: commands.Bot, main_config: Dict[str, Any], b4a_data: B4ALoader):
+    def __init__(self, bot: commands.Bot, config: dict[str, Any], b4a_data: B4ALoader):
         self.bot = bot
-        self.main_config = main_config # Main agent config (LLM, etc.)
+        self.config = config # Agent config (LLM, etc.)
         self.b4a_data = b4a_data     # Loaded B4A source data
-        self.mcp_connections: Dict[str, MCPClient] = {} # Keyed by MCPConfig.name
-        self.mcp_tools: Dict[str, List[ToolDef]] = {} # Keyed by MCPConfig.name
-        self.message_history: Dict[int, List[Dict[str, Any]]] = {}
+        self.mcp_connections: dict[str, MCPClient] = {} # Keyed by MCPConfig.name
+        self.mcp_tools: dict[str, list[ToolDef]] = {} # Keyed by MCPConfig.name
+        self.message_history: dict[int, list[dict[str, Any]]] = {}
 
-        self._connection_tasks: Dict[str, asyncio.Task] = {}
+        self._connection_tasks: dict[str, asyncio.Task] = {}
         self._shutdown_event = asyncio.Event()
 
         # LLM Client and Parameter Initialization
-        llm_endpoint_config = self.main_config.get('llm_endpoint', {})
-        model_params_config = self.main_config.get('model_params', {})
+        llm_endpoint_config = self.config.get('llm_endpoint', {})
+        model_params_config = self.config.get('model_params', {})
 
         # Initialize LLM Client
         llm_init_params = {k: resolve_value(v) for k, v in llm_endpoint_config.items() if k in ALLOWED_FOR_LLM_INIT}
-        if 'api_key' not in llm_init_params: llm_init_params['api_key'] = 'missing-key' # Or handle error
+        if 'api_key' not in llm_init_params:
+            llm_init_params['api_key'] = 'missing-key' # Or handle error
         if not llm_init_params.get('base_url'):
             raise ValueError('LLM \'base_url\' is required.')
 
@@ -180,12 +184,12 @@ class MCPCog(commands.Cog):
             try:
                 # TODO: Add auth handling here based on mcp_config fields if needed
                 client = MCPClient(url)
-                logger.info(f'MCPClient instance created for \'{name}\'. Listing tools…')
+                logger.info(f'MCPClient instance created for \'{name}\'. listing tools…')
 
-                # List Tools acts as connection check & fetches tool info
+                # list Tools acts as connection check & fetches tool info
                 # Will likely handle the underlying SSE connection setup and MCP handshake implicitly
                 # Add timeout? Check whether MCPClient handles that, but add ours, for now
-                tools_list: List[ToolDef] = await asyncio.wait_for(client.list_tools(), timeout=45.0)
+                tools_list: list[ToolDef] = await asyncio.wait_for(client.list_tools(), timeout=45.0)
 
                 self.mcp_connections[name] = client
                 self.mcp_tools[name] = tools_list
@@ -310,7 +314,7 @@ class MCPCog(commands.Cog):
         self._connection_tasks.clear() # Clear the task references
         logger.info('MCPCog unloaded and connection resources cleared.')
 
-    async def execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> Union[ToolInvocationResult, Dict[str, str]]:
+    async def execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> Union[ToolInvocationResult, dict[str, str]]:
         '''
         Execute an MCP tool using a managed MCPClient instance.
         Returns ToolInvocationResult on success, or an error dictionary.
@@ -381,7 +385,7 @@ class MCPCog(commands.Cog):
             logger.exception(f'Unexpected error calling tool "{tool_name}" on server "{server_name_found}"', tool_input=tool_input)
             return {'error': f'Error calling tool "{tool_name}": {str(e)}'}
 
-    def format_calltoolresult_content(self, result: Union[ToolInvocationResult, Dict[str, str]]) -> str:
+    def format_calltoolresult_content(self, result: Union[ToolInvocationResult, dict[str, str]]) -> str:
         '''
         Extract content from a ToolInvocationResult object or format error dict.
         Handles common MCP content structures like text content.
@@ -425,7 +429,7 @@ class MCPCog(commands.Cog):
             logger.warning('Unexpected format received in format_calltoolresult_content', received_result=result)
             return f'Unexpected tool result format: {str(result)[:200]}'
 
-    def get_channel_history(self, channel_id: int) -> List[Dict[str, Any]]:
+    def get_channel_history(self, channel_id: int) -> list[dict[str, Any]]:
         '''
         Get message history for a channel, or initialize if not exists.
         Includes basic history length management.
@@ -464,7 +468,7 @@ class MCPCog(commands.Cog):
             logger.debug(f"Mapped MCP type '{mcp_type}' to JSON type '{json_type}'.")
         return json_type
 
-    async def format_tools_for_openai(self) -> List[Dict[str, Any]]:
+    async def format_tools_for_openai(self) -> list[dict[str, Any]]:
         '''
         Format active MCP tools (from ToolDef) for OpenAI API.
         '''
@@ -476,7 +480,7 @@ class MCPCog(commands.Cog):
                 logger.warning(f'Server "{server_name}" is connected but has no tools listed. Skipping for OpenAI format.', server_name=server_name)
                 continue
 
-            tool_defs: List[ToolDef] = self.mcp_tools[server_name]
+            tool_defs: list[ToolDef] = self.mcp_tools[server_name]
             logger.debug(f'Formatting {len(tool_defs)} tools from active server "{server_name}" for OpenAI.')
 
             for tool in tool_defs:
@@ -582,14 +586,15 @@ class MCPCog(commands.Cog):
 
             # LLM Call & Response Handling
             initial_response_content = ''
-            tool_calls_aggregated: List[Dict[str, Any]] = []
-            assistant_message_dict: Dict[str, Any] = {'role': 'assistant', 'content': None}
+            tool_calls_aggregated: list[dict[str, Any]] = []
+            assistant_message_dict: dict[str, Any] = {'role': 'assistant', 'content': None}
 
             logger.debug(f'Initiating LLM call for channel {channel_id}', user_id=user_id, stream=stream, model=chat_params.get('model'))
             try:
                 if stream:
-                    llm_stream = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **chat_params)
-                    current_tool_calls: List[Dict[str, Any]] = []
+                    # llm_stream = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **chat_params)
+                    llm_stream = await self.llm_client.chat.completions.create(messages=channel_history, **chat_params)
+                    current_tool_calls: list[dict[str, Any]] = []
                     async for chunk in llm_stream:
                         delta: Optional[ChoiceDelta] = chunk.choices[0].delta if chunk.choices else None
                         if not delta: continue
@@ -597,7 +602,8 @@ class MCPCog(commands.Cog):
                         if delta.tool_calls:
                             for tool_call_chunk in delta.tool_calls:
                                 idx = tool_call_chunk.index
-                                while len(current_tool_calls) <= idx: current_tool_calls.append({'id': None, 'type': 'function', 'function': {'name': '', 'arguments': ''}})
+                                while len(current_tool_calls) <= idx:
+                                    current_tool_calls.append({'id': None, 'type': 'function', 'function': {'name': '', 'arguments': ''}})
                                 tc_ref = current_tool_calls[idx]
                                 chunk_func: Optional[ChoiceDeltaToolCall.Function] = tool_call_chunk.function
                                 if tool_call_chunk.id: tc_ref['id'] = tool_call_chunk.id
@@ -606,14 +612,15 @@ class MCPCog(commands.Cog):
                                     if chunk_func.arguments: tc_ref['function']['arguments'] += chunk_func.arguments
                     tool_calls_aggregated = [tc for tc in current_tool_calls if tc.get('id') and tc['function'].get('name')]
                 else: # Non-Streaming
-                    response = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **chat_params)
+                    # response = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **chat_params)
+                    response = await self.llm_client.chat.completions.create(messages=channel_history, **chat_params)
                     response_message: Optional[ChatCompletionMessage] = response.choices[0].message if response.choices else None
                     if not response_message:
                          logger.error('LLM response missing message object', response_data=response.model_dump_json(indent=2))
                          await send_long_message(sendable, '⚠️ Received an empty response from AI.', followup=send_followup, ephemeral=is_interaction)
                          return
                     initial_response_content = response_message.content or ''
-                    raw_tool_calls: Optional[List[ChatCompletionMessageToolCall]] = response_message.tool_calls
+                    raw_tool_calls: Optional[list[ChatCompletionMessageToolCall]] = response_message.tool_calls
                     if raw_tool_calls:
                          tool_calls_aggregated = [{'id': tc.id, 'type': tc.type, 'function': {'name': tc.function.name, 'arguments': tc.function.arguments}}
                                                   for tc in raw_tool_calls if tc.type == 'function' and tc.function and tc.id and tc.function.name]
@@ -719,11 +726,13 @@ class MCPCog(commands.Cog):
                     follow_up_text = ''
                     try:
                         if stream:
-                            follow_up_stream = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **follow_up_params)
+                            # follow_up_stream = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **follow_up_params)
+                            follow_up_stream = await self.llm_client.chat.completions.create(messages=channel_history, **follow_up_params)
                             async for chunk in follow_up_stream:
                                 if token := chunk.choices[0].delta.content or '': follow_up_text += token
                         else:
-                            follow_up_response = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **follow_up_params)
+                            # follow_up_response = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **follow_up_params)
+                            follow_up_response = await self.llm_client.chat.completions.create(messages=channel_history, **follow_up_params)
                             follow_up_message = follow_up_response.choices[0].message if follow_up_response.choices else None
                             if follow_up_message: follow_up_text = follow_up_message.content or ''
 
@@ -748,7 +757,7 @@ class MCPCog(commands.Cog):
         except Exception as e:
             logger.exception(f'Unhandled error during chat logic execution for channel {channel_id}', user_id=user_id, stream=stream)
             try:
-                 error_message = f'An unexpected error occurred while processing your request. Please check the logs.'
+                 error_message = 'An unexpected error occurred while processing your request. Please check the logs.'
                  await send_long_message(sendable, error_message, followup=send_followup, ephemeral=True) # Send ephemeral
             except Exception as send_err:
                  logger.error('Failed to send error message back to user after main chat logic failure', send_error=send_err)
@@ -761,7 +770,7 @@ class MCPCog(commands.Cog):
         ''' Cog ready listener. Connection tasks are started in cog_load. '''
         logger.info(f'Cog {self.__class__.__name__} is ready.')
 
-    @app_commands.command(name='context_info', description='List configured B4A (model context) sources and their status')
+    @app_commands.command(name='context_info', description='list configured B4A (model context) sources and their status')
     async def context_info_slash(self, interaction: discord.Interaction):
         ''' Command to list configured B4A sources and MCP connection status. '''
         logger.info(f'Command \'/context_info\' invoked by {interaction.user}')

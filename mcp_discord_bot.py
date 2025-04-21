@@ -7,7 +7,8 @@ import tomllib
 import logging
 import sys
 import io
-from typing import Dict, Any # Added for type hint
+from typing import Any
+from pathlib import Path
 
 import fire
 import discord
@@ -21,8 +22,7 @@ from b4a_config import load_b4a, B4ALoader
 
 logger = structlog.get_logger()
 
-# setup_logging function remains the same...
-def setup_logging(classic_tracebacks: bool = False):
+def setup_logging(classic_tracebacks: bool = False, log_level_str: str = 'INFO'):
     '''Configures structlog processors and rendering.'''
     console_renderer_kwargs = {'colors': True}
     if classic_tracebacks:
@@ -58,9 +58,21 @@ def setup_logging(classic_tracebacks: bool = False):
     root_logger.addHandler(handler)
     root_logger.setLevel(logging.INFO)
 
+    # Convert string level name to logging constant (e.g., 'DEBUG' -> logging.DEBUG)
+    # Default to INFO if the level is invalid
+    numeric_level = getattr(logging, log_level_str.upper(), None)
+    if not isinstance(numeric_level, int):
+        # Use initial logger config which might still be INFO level before this point
+        logging.warning(f"Invalid log level '{log_level_str}' provided. Defaulting to INFO.")
+        numeric_level = logging.INFO
+        log_level_str = 'INFO' # Ensure we log the level actually being set
 
-# Modified load_config - NO LONGER returns B4A results directly
-def load_main_config(config_path: str) -> Dict[str, Any]:
+    # Log the level being set *before* actually setting it on the root logger
+    # This message will appear if the *current* level allows INFO messages.
+    logger.info(f"Setting root logger level to: {log_level_str.upper()}")
+    root_logger.setLevel(numeric_level)
+
+def load_main_config(config_path: Path) -> dict[str, Any]:
     '''Loads ONLY the main TOML configuration file.'''
     if not config_path:
         raise ValueError('Configuration file path is required.')
@@ -78,7 +90,7 @@ def load_main_config(config_path: str) -> Dict[str, Any]:
         logger.error(f'Unexpected error loading main config: {config_path}', exc_info=True)
         raise
 
-    # --- Basic Validation for Sections Needed by the Bot ---
+    # Basic Validation for Sections Needed by the Bot
     # B4A sources are checked inside the B4ALoader
     if 'llm_endpoint' not in config:
         logger.warning("Config missing section '[llm_endpoint]'. LLM features may be limited.")
@@ -86,7 +98,6 @@ def load_main_config(config_path: str) -> Dict[str, Any]:
     if 'model_params' not in config:
         logger.info("Config missing section '[model_params]'. Using default LLM parameters.")
         config['model_params'] = {}
-    # [mcp] section is NO LONGER directly used for connections
 
     # Validate/Default LLM Endpoint config (remains important for the agent itself)
     config.setdefault('llm_endpoint', {})
@@ -109,42 +120,64 @@ def load_main_config(config_path: str) -> Dict[str, Any]:
 def main(
     config_path: str = None,
     discord_token: str = None,
-    classic_tracebacks: bool = False
+    classic_tracebacks: bool = False,
+    loglevel: str = 'INFO'
     ):
     '''Main function to launch the MCP Discord bot.'''
 
-    setup_logging(classic_tracebacks)
+    # Priority: CLI > Environment Variable > Default
+    env_loglevel = os.environ.get('AIBOT_LOGLEVEL')
+    effective_loglevel = loglevel # Start with CLI arg (or its default 'INFO')
 
-    # --- Argument Handling (Token & Config Path) ---
-    if not discord_token:
-        discord_token = os.environ.get('MCP_DISCORD_TOKEN')
+    log_source = "default"
+    if loglevel != 'INFO': # CLI was explicitly set to something other than default
+        log_source = "CLI argument (--loglevel)"
+    elif env_loglevel: # CLI was default ('INFO'), but ENV var is set
+        effective_loglevel = env_loglevel
+        log_source = "environment variable (AIBOT_LOGLEVEL)"
+
+    # Call setup_logging *before* other logging, passing the determined level
+    # Use upper case for consistency
+    effective_loglevel_upper = effective_loglevel.upper()
+    setup_logging(classic_tracebacks, log_level_str=effective_loglevel_upper)
+    # Log the source *after* setup_logging might have changed the level
+    if log_source != "default":
+        logger.info(f"Log level '{effective_loglevel_upper}' set via {log_source}.")
+ 
+    # Argument Handling (Token & Config Path)
+    if not discord_token or discord_token is True:  # If user accidentally does --discord-token alone, it resolves to True
+        discord_token = os.environ.get('AIBOT_DISCORD_TOKEN')
         if not discord_token:
-             logger.critical('Discord token must be provided via --discord-token or MCP_DISCORD_TOKEN env var.')
+             logger.critical('Discord token must be provided via --discord-token or AIBOT_DISCORD_TOKEN env var.')
              sys.exit(1)
-        else: logger.info('Using Discord token from MCP_DISCORD_TOKEN environment variable.')
+        else: logger.info('Using Discord token from AIBOT_DISCORD_TOKEN environment variable.')
 
     if not config_path:
-        config_path = os.environ.get('MCP_DISCORD_CONFIG_PATH')
+        config_path = os.environ.get('AIBOT_DISCORD_CONFIG_PATH')
         if not config_path:
-            logger.critical('Config path must be provided via --config-path or MCP_DISCORD_CONFIG_PATH env var.')
+            logger.critical('Config path must be provided via --config-path or AIBOT_DISCORD_CONFIG_PATH env var.')
             sys.exit(1)
-        else: logger.info(f'Using config path from MCP_DISCORD_CONFIG_PATH env var: {config_path}')
+        else: logger.info(f'Using config path from AIBOT_DISCORD_CONFIG_PATH env var: {config_path}')
 
-    # --- Configuration Loading ---
+    # Configuration Loading
     try:
-        # 1. Load the main config file
-        main_config = load_main_config(config_path)
-        config_directory = os.path.dirname(config_path) # Needed for relative paths
+        # Load the main config file. Use pathlib. Look for a file named main.toml within the config_path directory.
+        config_path = Path(config_path)
+        if not config_path.exists():
+            logger.critical(f'Config path does not exist: {config_path}')
+            sys.exit(1)
 
-        # 2. Load B4A sources using the loader
-        b4a_data: B4ALoader = load_b4a(main_config, config_directory)
+        main_config_fpath = config_path / 'main.toml'
+        main_config = load_main_config(main_config_fpath)
+
+        # Load B4A sources using the loader
+        b4a_data: B4ALoader = load_b4a(main_config, config_path)
         # b4a_data now holds .mcp_sources, .rss_sources, .load_errors etc.
 
     except Exception:
         logger.critical('Failed during configuration loading phase. Exiting.', exc_info=True)
         sys.exit(1)
 
-    # --- Bot Setup ---
     logger.info('Setting up Discord bot intents…')
     intents = discord.Intents.default()
     intents.message_content = True
@@ -160,7 +193,7 @@ def main(
         logger.critical(f'Failed to initialize MCPCog: {e}', exc_info=True)
         sys.exit(1)
 
-    # --- Async Setup (Cog loading, Command Sync) ---
+    # Async Setup (Cog loading, Command Sync)
     async def setup_bot():
         logger.info('Adding MCPCog to bot…')
         await bot.add_cog(mcp_cog)
@@ -184,14 +217,22 @@ def main(
         logger.info(f'Bot logged in as {bot.user.name} (ID: {bot.user.id})')
         logger.info('Bot is ready and listening for commands.')
 
-    # --- Bot Run ---
     logger.info('Starting bot…')
     try:
-        bot.run(discord_token, log_handler=None, log_level=logging.INFO)
-    except discord.LoginFailure: logger.critical('Login failed: Invalid Discord token.')
-    except discord.PrivilegedIntentsRequired: logger.critical("Privileged intents required but not enabled.")
-    except Exception as e: logger.critical('Unexpected error running the bot.', exc_info=True)
-    finally: logger.info('Bot shutdown sequence initiated.')
+        # Convert the effective level string back to a logging constant for discord.py
+        discord_log_level = getattr(logging, effective_loglevel_upper, logging.INFO)
+        if not isinstance(discord_log_level, int): # Safety check
+            discord_log_level = logging.INFO
+
+        bot.run(discord_token, log_handler=None, log_level=discord_log_level) # Use dynamic level
+    except discord.LoginFailure:
+        logger.critical('Login failed: Invalid Discord token.')
+    except discord.PrivilegedIntentsRequired:
+        logger.critical("Privileged intents required but not enabled.")
+    except Exception as e:
+        logger.critical('Unexpected error running the bot.', exc_info=True)
+    finally:
+        logger.info('Bot shutdown sequence initiated.')
 
 
 if __name__ == '__main__':

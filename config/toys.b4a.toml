@@ -1,0 +1,17 @@
+# toys.b4a.toml
+# Describes connecting to an MCP Server that provides a basket of silly demo tools
+# Simple demo of delegating to MCP for tools loading
+
+[[context_source]]
+name = "mcp-toys"
+description = "A basket of silly demo tools"
+type = "@mcp" # REQUIRED: Specifies the integration handler type.
+
+# Configuration specific to the '.mcp' handler:
+connection_method = "sse" # REQUIRED: How to communicate (e.g., 'sse', 'stdio').
+url = "http://localhost:8902/sse" # REQUIRED: Endpoint for the MCP Server (SSE example).
+# Or for stdio:
+# connection_method = "stdio"
+# command = ["python", "path/to/mcp_server_script.py"]
+
+# The toy servers do no auth
