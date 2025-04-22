@@ -24,8 +24,8 @@ uvicorn toy_mcp_server:create_app --factory --host 127.0.0.1 --port 8902
 Make sure you set up any other MCP or other resources you've specified in your B4A. Now you can run the bot.
 
 ```sh
-# Assumes you've exported DISCORD_TOKEN="YOUR_TOKEN" 
-python mcp_discord_bot.py --discord-token $DISCORD_TOKEN --config-path config/mymain.toml
+# Assumes you've exported DISCORD_TOKEN="YOUR_TOKEN"
+python mcp_discord_bot.py --discord-token $DISCORD_TOKEN --config-path config
 ```
 
 Structlog/rich tracebacks can be elaborate, so there is a `--classic-tracebacks` option to tame them
@@ -36,7 +36,7 @@ Note: you can use the environment rather than `--discord-token` & `--config-path
 
 ```sh
 export AIBOT_DISCORD_TOKEN="YOUR_TOKEN"
-export AIBOT_DISCORD_CONFIG_PATH="./config.toml"
+export AIBOT_DISCORD_CONFIG_PATH="./config"
 python mcp_discord_bot.py # Reads from env vars
 ```
 
@@ -54,7 +54,26 @@ mlx-omni-server --port 1234
 # mlx_lm.server --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 1234
 ```
 
-Note: with mlx-omni-server ran into `RuntimeError: Failed to generate completion: generate_step() got an unexpected keyword argument 'user'`
+Note: with mlx-omni-server [ran into `RuntimeError: Failed to generate completion: generate_step() got an unexpected keyword argument 'user'`](https://github.com/madroidmaq/mlx-omni-server/issues/37)
+
+Fixed with this patch:
+
+```diff
+diff --git a/chat/mlx/mlx_model.py b/chat/mlx/mlx_model.py
+index da7aef5..094ae9c 100644
+--- a/chat/mlx/mlx_model.py
++++ b/chat/mlx/mlx_model.py
+@@ -45,6 +45,9 @@ class MLXModel(BaseTextModel):
+ 
+     def _get_generation_params(self, request: ChatCompletionRequest) -> Dict[str, Any]:
+         params = request.get_extra_params()
++        # Exclude user. See #37
++        if "user" in params:
++            del params["user"]
+         known_params = {
+             "top_k",
+             "min_tokens_to_keep",
+```
 
 There are [many local MLX models](https://huggingface.co/mlx-community) from which you can pick
 

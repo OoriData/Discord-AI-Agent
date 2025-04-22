@@ -558,19 +558,84 @@ class MCPCog(commands.Cog):
         message: str,
         channel_id: int,
         user_id: int,
-        stream: bool
+        stream: bool,
+        attachments: Optional[list[discord.Attachment]] = None
     ):
         '''
-        Core logic for handling chat interactions, LLM calls, and tool execution.
-        (Largely unchanged, check error handling and result formatting calls)
+        Core logic for handling chat interactions, LLM calls, and tool execution,
+        plus basic attachment handling.
         '''
         is_interaction = isinstance(sendable, discord.Interaction)
         send_followup = is_interaction and sendable.response.is_done()
 
+        processed_message = message # Start with the original text message
+
+        # Attachment Handling
+        if attachments:
+            logger.info(f'Processing {len(attachments)} attachments for channel {channel_id}', user_id=user_id)
+            attachment_texts = []
+            for attachment in attachments:
+                try:
+                    # Basic info
+                    attachment_info = f'\n\n--- Attachment: {attachment.filename} ({attachment.content_type}, {attachment.size} bytes) ---\n'
+
+                    # Placeholder for file type registration and preprocessing
+                    # Example:
+                    # registered_handler = file_handlers.get(attachment.content_type)
+                    # if registered_handler:
+                    #     content = await registered_handler(attachment)
+                    # elif attachment.content_type.startswith('image/'):
+                    #     # Placeholder for image-to-text model
+                    #     content = f'[Content of image {attachment.filename} - requires image model]'
+                    # elif attachment.filename.endswith('.xlsx'):
+                    #     # Placeholder for Excel to CSV/text conversion
+                    #     content = f'[Content of Excel file {attachment.filename} - requires processing]'
+                    # elif attachment.content_type.startswith('text/'):
+                    #     # Default: Read text-based files directly
+                    #     content_bytes = await attachment.read()
+                    #     # Attempt decoding, fall back to representing as bytes if fails
+                    #     try:
+                    #         content = content_bytes.decode('utf-8') # Or try other common encodings
+                    #     except UnicodeDecodeError:
+                    #         logger.warning(f'Could not decode attachment {attachment.filename} as UTF-8.', attachment_id=attachment.id)
+                    #         content = f'[Binary content of {attachment.filename}]'
+                    # else:
+                    #     # Default for unknown types
+                    #     content = f'[Unsupported attachment type: {attachment.content_type}]'
+
+                    # Default behavior: Read text files, provide placeholder for others
+                    if attachment.content_type and attachment.content_type.startswith('text/'):
+                        try:
+                            content_bytes = await attachment.read()
+                            content = content_bytes.decode('utf-8')
+                            # Optional: Truncate large files
+                            max_len = 5000 # Example limit
+                            if len(content) > max_len:
+                                content = content[:max_len] + '\n[... content truncated ...]'
+                        except UnicodeDecodeError:
+                            logger.warning(f'Could not decode text attachment {attachment.filename} as UTF-8.', attachment_id=attachment.id)
+                            content = f'[Could not decode content of {attachment.filename}]'
+                        except discord.HTTPException as e:
+                            logger.error(f'Failed to read attachment {attachment.filename}: {e}', attachment_id=attachment.id)
+                            content = f'[Error reading attachment {attachment.filename}]'
+                    else:
+                        # Placeholder for non-text files (images, pdf, excel etc.)
+                        content = f'[Content of non-text file: {attachment.filename} ({attachment.content_type}) - requires specific processing]'
+
+                    attachment_texts.append(attachment_info + content)
+
+                except Exception as e:
+                    logger.exception(f'Error processing attachment {attachment.filename}', attachment_id=attachment.id)
+                    attachment_texts.append(f'\n\n[Error processing attachment: {attachment.filename}]')
+
+            # Prepend attachment contents to the user's message
+            processed_message = "".join(attachment_texts) + "\n\n--- User Message ---\n" + message
+            logger.debug(f'Added content from {len(attachments)} attachments to the message.')
+
         try:
             # Get and update history
             channel_history = self.get_channel_history(channel_id)
-            channel_history.append({'role': 'user', 'content': message})
+            channel_history.append({'role': 'user', 'content': processed_message})
             logger.debug(f'User message added to history for channel {channel_id}', user_id=user_id, stream=stream)
 
             # Prepare chat parameters (Combine endpoint & explicit settings)
@@ -592,8 +657,8 @@ class MCPCog(commands.Cog):
             logger.debug(f'Initiating LLM call for channel {channel_id}', user_id=user_id, stream=stream, model=chat_params.get('model'))
             try:
                 if stream:
-                    # llm_stream = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **chat_params)
-                    llm_stream = await self.llm_client.chat.completions.create(messages=channel_history, **chat_params)
+                    llm_stream = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **chat_params)
+                    # llm_stream = await self.llm_client.chat.completions.create(messages=channel_history, **chat_params)
                     current_tool_calls: list[dict[str, Any]] = []
                     async for chunk in llm_stream:
                         delta: Optional[ChoiceDelta] = chunk.choices[0].delta if chunk.choices else None
@@ -612,8 +677,8 @@ class MCPCog(commands.Cog):
                                     if chunk_func.arguments: tc_ref['function']['arguments'] += chunk_func.arguments
                     tool_calls_aggregated = [tc for tc in current_tool_calls if tc.get('id') and tc['function'].get('name')]
                 else: # Non-Streaming
-                    # response = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **chat_params)
-                    response = await self.llm_client.chat.completions.create(messages=channel_history, **chat_params)
+                    response = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **chat_params)
+                    # response = await self.llm_client.chat.completions.create(messages=channel_history, **chat_params)
                     response_message: Optional[ChatCompletionMessage] = response.choices[0].message if response.choices else None
                     if not response_message:
                          logger.error('LLM response missing message object', response_data=response.model_dump_json(indent=2))
@@ -726,13 +791,13 @@ class MCPCog(commands.Cog):
                     follow_up_text = ''
                     try:
                         if stream:
-                            # follow_up_stream = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **follow_up_params)
-                            follow_up_stream = await self.llm_client.chat.completions.create(messages=channel_history, **follow_up_params)
+                            follow_up_stream = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **follow_up_params)
+                            # follow_up_stream = await self.llm_client.chat.completions.create(messages=channel_history, **follow_up_params)
                             async for chunk in follow_up_stream:
                                 if token := chunk.choices[0].delta.content or '': follow_up_text += token
                         else:
-                            # follow_up_response = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **follow_up_params)
-                            follow_up_response = await self.llm_client.chat.completions.create(messages=channel_history, **follow_up_params)
+                            follow_up_response = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **follow_up_params)
+                            # follow_up_response = await self.llm_client.chat.completions.create(messages=channel_history, **follow_up_params)
                             follow_up_message = follow_up_response.choices[0].message if follow_up_response.choices else None
                             if follow_up_message: follow_up_text = follow_up_message.content or ''
 
@@ -839,10 +904,16 @@ class MCPCog(commands.Cog):
         channel_id = ctx.channel.id
         user_id = ctx.author.id
 
-        # Check if message is empty after stripping whitespace
-        if not message.strip():
-             await ctx.send("⚠️ Please provide a message to chat about!")
-             return
+        # Check if message is empty OR if there are only attachments and no message text
+        # Not allowing attachment-only messages in this case, but let's check that
+        if not message.strip() and not ctx.message.attachments:
+            await ctx.send("⚠️ Please provide a message or attach a file to chat about!")
+            return
+
+        # Get attachments
+        attachments = ctx.message.attachments
+        if attachments:
+            logger.info(f'Prefix command !chat received {len(attachments)} attachments.')
 
         async with ctx.typing():
             await self._handle_chat_logic(
@@ -850,7 +921,8 @@ class MCPCog(commands.Cog):
                 message=message,
                 channel_id=channel_id,
                 user_id=user_id,
-                stream=False # Keep Prefix non-streaming for simplicity
+                stream=False, # Keep Prefix non-streaming for simplicity
+                attachments=attachments
             )
 
     @chat_command.error
@@ -866,18 +938,24 @@ class MCPCog(commands.Cog):
 
     # Slash form
     @app_commands.command(name='chat', description='Chat with the AI assistant')
-    @app_commands.describe(message='Your message to the AI')
+    @app_commands.describe(message='Your message to the AI', attachment='Optional file to discuss')
     @app_commands.checks.cooldown(1, 10, key=lambda i: i.user.id) # Cooldown per user
-    async def chat_slash(self, interaction: discord.Interaction, message: str):
+    async def chat_slash(self, interaction: discord.Interaction,
+        message: str, attachment: Optional[discord.Attachment] = None):
         ''' Slash command version of the chat command. '''
         logger.info(f'Slash command `/chat` invoked by {interaction.user} ({interaction.user.id}) in channel {interaction.channel_id}')
         channel_id = interaction.channel_id
         user_id = interaction.user.id
 
-        # Check for empty message early
-        if not message.strip():
-             await interaction.response.send_message("⚠️ Please provide a message to chat about!", ephemeral=True)
-             return
+        # Check for empty message/attachment
+        if not message.strip() and not attachment:
+            await interaction.response.send_message("⚠️ Please provide a message or attach a file to chat about!", ephemeral=True)
+            return
+
+        # Prepare attachments list (even if only one)
+        attachments_list = [attachment] if attachment else []
+        if attachments_list:
+            logger.info(f'Slash command /chat received an attachment: {attachment.filename}')
 
         # Defer response
         await interaction.response.defer(thinking=True, ephemeral=False) # Non-ephemeral for public results
@@ -887,7 +965,8 @@ class MCPCog(commands.Cog):
             message=message,
             channel_id=channel_id,
             user_id=user_id,
-            stream=False # Keep Slash non-streaming for now
+            stream=False, # Keep Slash non-streaming for now
+            attachments=attachments_list
         )
 
     @chat_slash.error

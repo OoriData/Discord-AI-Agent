@@ -1,6 +1,8 @@
 # mcp_discord_bot.py
 '''
 Main launcher for MCP Discord bot. Loads config (including B4A sources) and the main cog.
+
+See README.md for info on how to run
 '''
 import os
 import tomllib
@@ -71,6 +73,7 @@ def setup_logging(classic_tracebacks: bool = False, log_level_str: str = 'INFO')
     # This message will appear if the *current* level allows INFO messages.
     logger.info(f"Setting root logger level to: {log_level_str.upper()}")
     root_logger.setLevel(numeric_level)
+
 
 def load_main_config(config_path: Path) -> dict[str, Any]:
     '''Loads ONLY the main TOML configuration file.'''

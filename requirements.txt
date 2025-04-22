@@ -1,2 +1,4 @@
 mcp
 discord
+structlog
+git+https://github.com/zanetworker/mcp-sse-client-python.git
