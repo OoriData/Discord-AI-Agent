@@ -1,8 +1,8 @@
 [b4a] # Config for e.g. tools & resources, perhaps via MCP
 
 source_sets = [
-  "toys.b4a.toml"
-  # "news.b4a.toml"
+  "toys.b4a.toml",
+  # "news.b4a.toml",
   # "gdrive_mcp.b4a.toml",
 ]
 

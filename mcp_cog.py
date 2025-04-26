@@ -10,6 +10,7 @@ from typing import Any, Union, Optional
 import traceback
 
 import discord
+from discord import app_commands, abc as discord_abc
 from discord.ext import commands
 from discord import app_commands
 import structlog
@@ -51,7 +52,7 @@ ALLOWED_FOR_LLM_CHAT = ['model', 'temperature', 'max_tokens', 'top_p'] # Added c
 
 
 # Helper Function for Message Splitting (Unchanged from provided code)
-async def send_long_message(sendable: Union[commands.Context, discord.Interaction], content: str, followup: bool = False, ephemeral: bool = False):
+async def send_long_message(sendable: Union[commands.Context, discord.Interaction, discord_abc.Messageable], content: str, followup: bool = False, ephemeral: bool = False):
     '''
     Sends a message, splitting it into multiple parts if it exceeds Discord's limit.
     Handles both Context and Interaction objects.
@@ -77,43 +78,49 @@ async def send_long_message(sendable: Union[commands.Context, discord.Interactio
                 send_ephemeral = ephemeral and can_be_ephemeral
 
                 if use_followup:
-                     if not sendable.response.is_done():
-                         # Interaction likely wasn't deferred or followup wasn't requested initially.
-                         # Use original response if possible, otherwise log warning.
-                         # This path is less common if defer() is used consistently.
-                         try:
+                    if not sendable.response.is_done():
+                        # Interaction likely wasn't deferred or followup wasn't requested initially.
+                        # Use original response if possible, otherwise log warning.
+                        # This path is less common if defer() is used consistently.
+                        try:
                             await sendable.response.send_message(chunk, ephemeral=send_ephemeral)
                             logger.debug("Sent initial interaction response (unexpected path after deferral).")
-                         except discord.InteractionResponded:
-                             logger.warning("Interaction already responded, but followup wasn't triggered correctly. Sending via followup.")
-                             await sendable.followup.send(chunk, ephemeral=send_ephemeral) # Fallback to followup
-                     else:
-                         await sendable.followup.send(chunk, ephemeral=send_ephemeral)
+                        except discord.InteractionResponded:
+                            logger.warning("Interaction already responded, but followup wasn't triggered correctly. Sending via followup.")
+                            await sendable.followup.send(chunk, ephemeral=send_ephemeral) # Fallback to followup
+                    else:
+                        await sendable.followup.send(chunk, ephemeral=send_ephemeral)
                 else:
                      # Initial response for non-deferred interaction or first message.
                      await sendable.response.send_message(chunk, ephemeral=send_ephemeral)
+            elif isinstance(sendable, discord_abc.Messageable):
+                # DMs don't support ephemeral or followups in the same way as interactions
+                # Just send directly to the channel
+                await sendable.send(chunk)
+                # Reset ephemeral flag for logging clarity if it was passed for a DM
+                ephemeral = False
 
         except discord.HTTPException as e:
-             logger.error(f'Failed to send message chunk: {e}', chunk_start=start, sendable_type=type(sendable), ephemeral=ephemeral, status=e.status, code=e.code)
-             # Try to inform user ephemerally if possible
-             error_msg = f'Error sending part of the message (Code: {e.code}). Please check channel permissions or message content.'
-             try:
+            logger.error(f'Failed to send message chunk: {e}', chunk_start=start, sendable_type=type(sendable), ephemeral=ephemeral, status=e.status, code=e.code)
+            # Try to inform user ephemerally if possible
+            error_msg = f'Error sending part of the message (Code: {e.code}). Please check channel permissions or message content.'
+            try:
                 if isinstance(sendable, discord.Interaction):
                     # Use followup if possible, it's more reliable after potential initial errors
                     if sendable.response.is_done():
                         await sendable.followup.send(error_msg, ephemeral=True)
                     else:
-                        await sendable.response.send_message(error_msg, ephemeral=True)
-                # Context sending is less likely to fail ephemerally
+                        # Avoid double-responding if initial send failed
+                        pass # await sendable.response.send_message(error_msg, ephemeral=True) # Risky if initial failed
                 # else: await sendable.send(error_msg) # Avoid sending public errors if interaction failed
-             except Exception:
+            except Exception:
                 pass # Avoid error loops
-             break # Stop sending further chunks on error
+            break # Stop sending further chunks on error
 
         start = end
         first_chunk = False
         if start < len(content_str): # Only sleep if more chunks are coming
-             await asyncio.sleep(0.2)
+            await asyncio.sleep(0.2)
 
 
 class MCPCog(commands.Cog):
@@ -554,7 +561,7 @@ class MCPCog(commands.Cog):
 
     async def _handle_chat_logic(
         self,
-        sendable: Union[commands.Context, discord.Interaction],
+        sendable: Union[commands.Context, discord.Interaction, discord_abc.Messageable],
         message: str,
         channel_id: int,
         user_id: int,
@@ -565,9 +572,12 @@ class MCPCog(commands.Cog):
         Core logic for handling chat interactions, LLM calls, and tool execution,
         plus basic attachment handling.
         '''
+        # Determine if we need to use followup/ephemeral (only for Interactions)
         is_interaction = isinstance(sendable, discord.Interaction)
         send_followup = is_interaction and sendable.response.is_done()
 
+        # Ephemeral only makes sense for interactions
+        can_be_ephemeral = is_interaction
         processed_message = message # Start with the original text message
 
         # Attachment Handling
@@ -681,43 +691,43 @@ class MCPCog(commands.Cog):
                     # response = await self.llm_client.chat.completions.create(messages=channel_history, **chat_params)
                     response_message: Optional[ChatCompletionMessage] = response.choices[0].message if response.choices else None
                     if not response_message:
-                         logger.error('LLM response missing message object', response_data=response.model_dump_json(indent=2))
-                         await send_long_message(sendable, '⚠️ Received an empty response from AI.', followup=send_followup, ephemeral=is_interaction)
-                         return
+                        logger.error('LLM response missing message object', response_data=response.model_dump_json(indent=2))
+                        await send_long_message(sendable, '⚠️ Received an empty response from AI.', followup=send_followup, ephemeral=can_be_ephemeral)
+                        return
                     initial_response_content = response_message.content or ''
                     raw_tool_calls: Optional[list[ChatCompletionMessageToolCall]] = response_message.tool_calls
                     if raw_tool_calls:
-                         tool_calls_aggregated = [{'id': tc.id, 'type': tc.type, 'function': {'name': tc.function.name, 'arguments': tc.function.arguments}}
-                                                  for tc in raw_tool_calls if tc.type == 'function' and tc.function and tc.id and tc.function.name]
-                         logger.debug(f'Non-streaming response included {len(tool_calls_aggregated)} raw tool calls.', channel_id=channel_id)
+                        tool_calls_aggregated = [{'id': tc.id, 'type': tc.type, 'function': {'name': tc.function.name, 'arguments': tc.function.arguments}}
+                                                for tc in raw_tool_calls if tc.type == 'function' and tc.function and tc.id and tc.function.name]
+                        logger.debug(f'Non-streaming response included {len(tool_calls_aggregated)} raw tool calls.', channel_id=channel_id)
 
             except OpenAIError as api_exc: # Catch specific OpenAI errors
                 logger.exception('Error during LLM API call', channel_id=channel_id, user_id=user_id, error_type=type(api_exc).__name__)
-                await send_long_message(sendable, f'⚠️ Error communicating with AI: {str(api_exc)}', followup=send_followup, ephemeral=is_interaction)
+                await send_long_message(sendable, f'⚠️ Error communicating with AI: {str(api_exc)}', followup=send_followup, ephemeral=can_be_ephemeral)
                 return
             except Exception as e: # Catch other unexpected errors (e.g., network)
-                 logger.exception('Unexpected error during LLM communication', channel_id=channel_id, user_id=user_id)
-                 await send_long_message(sendable, f'⚠️ Unexpected error communicating with AI: {str(e)}', followup=send_followup, ephemeral=is_interaction)
-                 return
+                logger.exception('Unexpected error during LLM communication', channel_id=channel_id, user_id=user_id)
+                await send_long_message(sendable, f'⚠️ Unexpected error communicating with AI: {str(e)}', followup=send_followup, ephemeral=can_be_ephemeral)
+                return
 
             # Send Initial Response & Update History (Unchanged)
             sent_initial_message = False
             if initial_response_content.strip():
                 logger.debug(f'Sending initial LLM response to channel {channel_id}', length=len(initial_response_content), stream=stream)
                 await send_long_message(sendable, initial_response_content, followup=send_followup)
-                assistant_message_dict['content'] = initial_response_content
+                assistant_message_dict['content'] = initial_response_content # Ephemeral handled by send_long_message
                 sent_initial_message = True
                 send_followup = True # Any subsequent messages MUST be followups
 
             if tool_calls_aggregated:
-                 assistant_message_dict['tool_calls'] = tool_calls_aggregated
-                 logger.info(f'LLM requested {len(tool_calls_aggregated)} tool call(s) for channel {channel_id}', tool_names=[tc['function']['name'] for tc in tool_calls_aggregated], stream=stream)
+                assistant_message_dict['tool_calls'] = tool_calls_aggregated
+                logger.info(f'LLM requested {len(tool_calls_aggregated)} tool call(s) for channel {channel_id}', tool_names=[tc['function']['name'] for tc in tool_calls_aggregated], stream=stream)
 
             if assistant_message_dict.get('content') or assistant_message_dict.get('tool_calls'):
                 channel_history.append(assistant_message_dict)
             elif not sent_initial_message:
                 logger.info(f'LLM call finished for channel {channel_id} with no text/tools.', stream=stream)
-                await send_long_message(sendable, 'I received your message but didn\'t have anything specific to add or do.', followup=send_followup, ephemeral=is_interaction)
+                await send_long_message(sendable, 'I received your message but didn\'t have anything specific to add or do.', followup=send_followup, ephemeral=can_be_ephemeral)
                 return
 
             # Process Tool Calls (Using updated execute_tool and formatters)
@@ -727,11 +737,11 @@ class MCPCog(commands.Cog):
                 for tool_call in tool_calls_aggregated:
                     # Basic validation of structure remains useful
                     if not isinstance(tool_call, dict) or 'function' not in tool_call or 'id' not in tool_call:
-                         logger.error('Malformed tool call structure received from LLM', tool_call_data=tool_call)
-                         continue
+                        logger.error('Malformed tool call structure received from LLM', tool_call_data=tool_call)
+                        continue
                     if not isinstance(tool_call['function'], dict) or 'name' not in tool_call['function'] or 'arguments' not in tool_call['function']:
-                         logger.error('Malformed tool call function structure received from LLM', tool_call_data=tool_call)
-                         continue
+                        logger.error('Malformed tool call function structure received from LLM', tool_call_data=tool_call)
+                        continue
 
                     tool_name = tool_call['function']['name']
                     tool_call_id = tool_call['id']
@@ -747,7 +757,7 @@ class MCPCog(commands.Cog):
                         except (json.JSONDecodeError, TypeError) as json_err:
                             logger.error(f'Failed to decode JSON args or not a dict for tool `{tool_name}`', args_str=arguments_str, tool_call_id=tool_call_id, error=str(json_err))
                             tool_result_content_for_llm = f'Error: Invalid JSON object arguments provided for tool "{tool_name}". LLM sent: {arguments_str}'
-                            await send_long_message(sendable, f'⚠️ Error: Couldn\'t understand arguments for tool `{tool_name}`. LLM provided malformed JSON: `{arguments_str}`', followup=True, ephemeral=is_interaction)
+                            await send_long_message(sendable, f'⚠️ Error: Couldn\'t understand arguments for tool `{tool_name}`. LLM provided malformed JSON: `{arguments_str}`', followup=True, ephemeral=can_be_ephemeral)
                             send_followup = True
                             # Append failure result to history
                             tool_results_for_history.append({'role': 'tool', 'tool_call_id': tool_call_id, 'name': tool_name, 'content': tool_result_content_for_llm})
@@ -767,7 +777,7 @@ class MCPCog(commands.Cog):
                         # Catch errors from execute_tool or format_calltoolresult_content itself (should be rare now)
                         logger.exception(f'Unexpected error during tool execution/formatting phase for `{tool_name}`', tool_call_id=tool_call_id)
                         tool_result_content_for_llm = f'Error during tool execution phase for "{tool_name}": {str(exec_e)}'
-                        await send_long_message(sendable, f'⚠️ Unexpected Error running tool `{tool_name}`: {str(exec_e)}', followup=True, ephemeral=is_interaction)
+                        await send_long_message(sendable, f'⚠️ Unexpected Error running tool `{tool_name}`: {str(exec_e)}', followup=True, ephemeral=can_be_ephemeral)
                         send_followup = True
 
                     # Append result to history
@@ -802,13 +812,13 @@ class MCPCog(commands.Cog):
                             if follow_up_message: follow_up_text = follow_up_message.content or ''
 
                     except OpenAIError as followup_exc: # Catch specific OpenAI errors
-                         logger.exception('Error during follow-up LLM call', channel_id=channel_id, user_id=user_id, error_type=type(followup_exc).__name__)
-                         await send_long_message(sendable, f'⚠️ Error getting follow-up response from AI: {str(followup_exc)}', followup=True, ephemeral=is_interaction)
-                         return
+                        logger.exception('Error during follow-up LLM call', channel_id=channel_id, user_id=user_id, error_type=type(followup_exc).__name__)
+                        await send_long_message(sendable, f'⚠️ Error getting follow-up response from AI: {str(followup_exc)}', followup=True, ephemeral=can_be_ephemeral)
+                        return
                     except Exception as e: # Catch other unexpected errors
-                         logger.exception('Unexpected error during follow-up LLM communication', channel_id=channel_id, user_id=user_id)
-                         await send_long_message(sendable, f'⚠️ Unexpected error getting follow-up AI response: {str(e)}', followup=True, ephemeral=is_interaction)
-                         return
+                        logger.exception('Unexpected error during follow-up LLM communication', channel_id=channel_id, user_id=user_id)
+                        await send_long_message(sendable, f'⚠️ Unexpected error getting follow-up AI response: {str(e)}', followup=True, ephemeral=can_be_ephemeral)
+                        return
 
                     # Send Follow-up & Update History
                     if follow_up_text.strip():
@@ -816,24 +826,66 @@ class MCPCog(commands.Cog):
                         await send_long_message(sendable, follow_up_text, followup=True) # Must be followup
                         channel_history.append({'role': 'assistant', 'content': follow_up_text})
                     else:
-                         logger.info(f'LLM follow-up call finished for channel {channel_id} with no text content.', stream=stream)
+                        logger.info(f'LLM follow-up call finished for channel {channel_id} with no text content.', stream=stream)
 
 
         except Exception as e:
             logger.exception(f'Unhandled error during chat logic execution for channel {channel_id}', user_id=user_id, stream=stream)
             try:
-                 error_message = 'An unexpected error occurred while processing your request. Please check the logs.'
-                 await send_long_message(sendable, error_message, followup=send_followup, ephemeral=True) # Send ephemeral
+                error_message = 'An unexpected error occurred while processing your request. Please check the logs.'
+                # Send ephemeral only if it's an interaction
+                await send_long_message(sendable, error_message, followup=send_followup, ephemeral=is_interaction)
+
             except Exception as send_err:
-                 logger.error('Failed to send error message back to user after main chat logic failure', send_error=send_err)
+                logger.error('Failed to send error message back to user after main chat logic failure', send_error=send_err)
 
-
-    # Discord Commands (mcp_list, chat_command, chat_slash)
+    # Event Listeners
 
     @commands.Cog.listener()
     async def on_ready(self):
         ''' Cog ready listener. Connection tasks are started in cog_load. '''
         logger.info(f'Cog {self.__class__.__name__} is ready.')
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        ''' Listener to handle direct messages (DMs) to the bot. '''
+        # Ignore messages from bots (including self)
+        if message.author.bot:
+            return
+
+        # Only process messages in DMs (where message.guild is None)
+        if message.guild is not None:
+            return
+
+        # Ignore messages that start with typical command prefixes
+        # to avoid potential conflicts if user accidentally uses one in DM
+        # You might adjust this list based on other bots or expected usage
+        common_prefixes = ['!', '/', '$', '%', '?', '.', ',']
+        if any(message.content.startswith(p) for p in common_prefixes):
+            # Optionally, you could inform the user prefixes aren't needed in DMs
+            # await message.channel.send("You don't need a prefix when talking to me in DMs!")
+            logger.debug(f'Ignoring DM from {message.author} starting with a common prefix: {message.content[:10]}...')
+            return
+
+        # Check for empty message content AND no attachments
+        if not message.content.strip() and not message.attachments:
+            logger.debug(f'Ignoring empty DM from {message.author}')
+            # Avoid sending 'provide a message' error for empty DMs, just ignore.
+            return
+
+        logger.info(f'Received DM from {message.author} ({message.author.id}) in channel {message.channel.id}')
+
+        # Use typing context manager for user feedback in the DM channel
+        async with message.channel.typing():
+            await self._handle_chat_logic(
+                sendable=message.channel, # Pass the DMChannel directly
+                message=message.content,
+                channel_id=message.channel.id,
+                user_id=message.author.id,
+                stream=False, # Defaulting DMs to non-streaming for simplicity
+                attachments=message.attachments
+            )
+    # Discord Commands (mcp_list, chat_command, chat_slash)
 
     @app_commands.command(name='context_info', description='list configured B4A (model context) sources and their status')
     async def context_info_slash(self, interaction: discord.Interaction):
@@ -844,14 +896,14 @@ class MCPCog(commands.Cog):
         message = '**B4A Sources Status:**\n\n'
 
         # MCP Sources
-        message += f'**MCP Sources (.mcp): {len(self.b4a_data.mcp_sources)} configured**\n'
+        message += f'**MCP Sources (@mcp): {len(self.b4a_data.mcp_sources)} configured**\n'
         if not self.b4a_data.mcp_sources: message += '  *None configured or loaded.*\n'
         for mcp_conf in self.b4a_data.mcp_sources:
             name = mcp_conf.name
             status_icon = '❓'
             status_text = 'Unknown'
             if name in self.mcp_connections and name in self.mcp_tools:
-                 status_icon = '🟢'; status_text = f'Connected ({len(self.mcp_tools[name])} tools)'
+                status_icon = '🟢'; status_text = f'Connected ({len(self.mcp_tools[name])} tools)'
             elif name in self.mcp_connections:
                 status_icon = '🟡'; status_text = 'Connected (Tool list issue?)'
             elif name in self._connection_tasks and not self._connection_tasks[name].done():
@@ -862,32 +914,32 @@ class MCPCog(commands.Cog):
         message += '\n'
 
         # RSS Sources
-        message += f'**RSS Sources (.rss): {len(self.b4a_data.rss_sources)} configured**\n'
+        message += f'**RSS Sources (@rss): {len(self.b4a_data.rss_sources)} configured**\n'
         if not self.b4a_data.rss_sources:
             message += '  *None configured or loaded.*\n'
         for rss_conf in self.b4a_data.rss_sources:
-             status_icon = '⚪' # Not actively managed by this cog yet
-             status_text = 'Loaded (Not Active)'
-             # TODO: Add logic here if RSS feeds become actively managed (e.g., fetch status)
-             message += f'- **{rss_conf.name}**: {status_icon} {status_text} ({rss_conf.url})\n'
+            status_icon = '⚪' # Not actively managed by this cog yet
+            status_text = 'Loaded (Not Active)'
+            # TODO: Add logic here if RSS feeds become actively managed (e.g., fetch status)
+            message += f'- **{rss_conf.name}**: {status_icon} {status_text} ({rss_conf.url})\n'
         message += '\n'
 
         # Unhandled Sources
         if self.b4a_data.unhandled_sources:
             message += f'**Unhandled Sources: {len(self.b4a_data.unhandled_sources)} found**\n'
             for src in self.b4a_data.unhandled_sources:
-                 name = src.get('_sourcename', 'Unknown Name')
-                 type = src.get('type', 'Unknown Type')
-                 reason = src.get('_reason', 'No handler')
-                 message += f'- **{name}**: ⚠️ Type \'{type}\' - {reason}\n'
+                name = src.get('_sourcename', 'Unknown Name')
+                type = src.get('type', 'Unknown Type')
+                reason = src.get('_reason', 'No handler')
+                message += f'- **{name}**: ⚠️ Type \'{type}\' - {reason}\n'
             message += '\n'
 
         # Loading Errors
         if self.b4a_data.load_errors:
-             message += f'**Loading Errors: {len(self.b4a_data.load_errors)} encountered**\n'
-             for path, err in self.b4a_data.load_errors[:5]: # Show first 5 errors
-                 message += f'- `{os.path.basename(path)}`: {err[:150]}…\n'
-             if len(self.b4a_data.load_errors) > 5: message += '- … (see logs for more details)\n'
+            message += f'**Loading Errors: {len(self.b4a_data.load_errors)} encountered**\n'
+            for path, err in self.b4a_data.load_errors[:5]: # Show first 5 errors
+                message += f'- `{os.path.basename(path)}`: {err[:150]}…\n'
+            if len(self.b4a_data.load_errors) > 5: message += '- … (see logs for more details)\n'
 
         await send_long_message(interaction, message.strip() or 'No B4A sources found or configured.', followup=True)
 
@@ -900,6 +952,11 @@ class MCPCog(commands.Cog):
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def chat_command(self, ctx: commands.Context, *, message: str):
         ''' Prefix command to chat with the LLM, using MCP tools. '''
+        # Prevent prefix command in DMs, as on_message handles DMs now
+        if ctx.guild is None:
+            await ctx.send('You don\'t need a prefix in DMs! Just send your message directly.')
+            return
+
         logger.info(f'Prefix command "!chat" invoked by {ctx.author} ({ctx.author.id}) in channel {ctx.channel.id}')
         channel_id = ctx.channel.id
         user_id = ctx.author.id
@@ -932,6 +989,8 @@ class MCPCog(commands.Cog):
             await ctx.send(f'⏳ Woah there! This command is on cooldown. Try again in {error.retry_after:.1f} seconds.', delete_after=10)
         elif isinstance(error, commands.MissingRequiredArgument):
              await ctx.send(f'⚠️ You need to provide a message! Usage: `{ctx.prefix}chat <your message>`')
+        elif isinstance(error, commands.NoPrivateMessage): # Should be caught by the check in the command now
+             await ctx.send('This prefix command cannot be used in DMs. Just send your message directly!')
         else:
             logger.error(f'Error in prefix command chat_command dispatch: {error}', exc_info=error)
             # Avoid sending generic error here if _handle_chat_logic sends its own
@@ -943,6 +1002,12 @@ class MCPCog(commands.Cog):
     async def chat_slash(self, interaction: discord.Interaction,
         message: str, attachment: Optional[discord.Attachment] = None):
         ''' Slash command version of the chat command. '''
+        # Slash commands can technically be invoked in DMs if enabled globally or for DMs.
+        # Let's keep it consistent and allow it, as _handle_chat_logic works fine.
+        # if interaction.guild is None:
+        #     await interaction.response.send_message("You can just send messages directly in DMs!", ephemeral=True)
+        #     return
+
         logger.info(f'Slash command `/chat` invoked by {interaction.user} ({interaction.user.id}) in channel {interaction.channel_id}')
         channel_id = interaction.channel_id
         user_id = interaction.user.id
@@ -984,6 +1049,8 @@ class MCPCog(commands.Cog):
         elif isinstance(error, app_commands.CheckFailure):
              error_message = 'You don\'t have the necessary permissions or conditions met to use this command.'
              logger.warning(f"CheckFailure for /chat by {interaction.user}: {error}")
+        # elif isinstance(error, app_commands.NoPrivateMessage): # If we added a guild_only check
+        #      error_message = 'This command cannot be used in Direct Messages.'
         else:
             # Log other errors (before our main logic runs)
             logger.error(f'Unhandled error in slash command chat_slash check/dispatch: {error}', interaction_id=interaction.id, exc_info=error)
