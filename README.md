@@ -40,6 +40,57 @@ export AIBOT_DISCORD_CONFIG_PATH="./config"
 python mcp_discord_bot.py # Reads from env vars
 ```
 
+## PGVector chat history
+
+To enable persistent chat history storage using a PostgreSQL database with the PGVector extension, Ensure you have a running PostgreSQL database server with the [pgvector extension](https://github.com/pgvector/pgvector) available, then set up the environment variables. See below for nots on DB setup.
+
+### Additional Python dependencies:
+
+```sh
+uv pip install ogbujipt pgvector asyncpg sentence-transformers
+```
+
+### Enable the Feature
+
+Set the `AIBOT_PGVECTOR_HISTORY_ENABLED` environment variable to `true`:
+
+You can either use a connection string or elaborated credentials.
+
+### Configure with DB connection string:
+
+Make sure it's in the `AIBOT_PG_CONNECT_STRING` environment variable. If this variable exists, it will supersede any other PG env vars.
+
+### Configure with DB connection components
+
+Other environment variables:
+
+* **Required:**
+    * `AIBOT_PG_DB_NAME`: Name of the database to use.
+    * `AIBOT_PG_USER`:
+    * `AIBOT_PG_PASSWORD`:
+* **Optional (Defaults Shown):**
+    * `AIBOT_PG_HOST`: Database host (default: `localhost`)
+    * `AIBOT_PG_PORT`: Database port (default: `5432`)
+    * `AIBOT_PG_TABLE_NAME`: Table name for storing history (default: `discord_chat_history`)
+    * `AIBOT_PG_EMBEDDING_MODEL`: Sentence Transformer model to use for embeddings (default: `all-MiniLM-L6-v2`)
+
+3.  **Database Setup:** [cite: 2]. You can use Docker for a quick setup (similar to the demo notebook [cite: 3]):
+
+```sh
+# Example using default user/pass/db - change values as needed!
+docker run --name pg_chat_history -d -p 5432:5432 \
+    -e POSTGRES_DB=YOUR_PGVECTOR_DB_NAME \
+    -e POSTGRES_USER=YOUR_PGVECTOR_USER \
+    -e POSTGRES_PASSWORD=YOUR_PGVECTOR_PASSWORD \
+    pgvector/pgvector
+```
+
+Replace `YOUR_PGVECTOR_DB_NAME`, `YOUR_PGVECTOR_USER`, and `YOUR_PGVECTOR_PASSWORD` with the values you set in the environment variables.
+
+The bot will automatically connect to the database, create the table (if it doesn't exist), and start storing/retrieving chat history
+from PGVector. If any required variables are missing or the connection fails, it will fall back to the default in-memory history.
+
+
 # Implementation notes
 
 * [discord.py](https://github.com/Rapptz/discord.py)
@@ -83,4 +134,37 @@ For SSE servers, you can check with curl, e.g.
 
 ```sh
 curl -N http://localhost:8901/sse
+```
+
+# Troubleshooting PGVector
+
+You can try a simple connection as follows, to make sure there is no exception:
+
+```py
+import os
+import asyncio
+from sentence_transformers import SentenceTransformer
+from ogbujipt.embedding.pgvector import MessageDB
+emodel_name = os.environ.get('AIBOT_PG_EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
+emodel = SentenceTransformer(emodel_name)
+su_conn_str = os.environ.get('AIBOT_PG_SUPERUSER_CONNECT_STRING')
+tname = os.environ.get('AIBOT_PG_TABLE_NAME', 'discord_chat_history')
+db = asyncio.run(await MessageDB.from_conn_string(su_conn_str, emodel, tname))
+```
+
+## Note for Supabase
+
+You can use the "Connect" icon at the top to get connection string info
+
+Unless you buy an IPV4 add-on you need to use the session pooler version of the connection string,
+or you'll get `nodename nor servname provided, or not known`. Ref: https://github.com/orgs/supabase/discussions/33534
+
+If so, don't forget to include the tenant ID (e.g. `[USER].hjdsfghjfbdhsk`; teh part after the dot) or you'll get InternalServerError: Tenant or user not found
+
+It's probably a good idea to have an app-level user, in order to assert least privilege.
+
+You can just use `util/supabase_setup.py`, which you should run only once.
+
+```sh
+op run --env-file .env -- python util/supabase_setup.py
 ```

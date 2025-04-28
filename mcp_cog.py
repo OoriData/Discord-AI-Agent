@@ -7,7 +7,8 @@ import os
 import json
 import asyncio
 from typing import Any, Union, Optional
-import traceback
+import uuid
+# import traceback
 
 import discord
 from discord import app_commands, abc as discord_abc
@@ -18,6 +19,7 @@ from openai import AsyncOpenAI, OpenAIError
 # Openai types might be useful for clarity
 from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageToolCall
 from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceDelta
+from ogbujipt.embedding.pgvector import MessageDB
 
 from mcp_sse_client import MCPClient, ToolDef, ToolInvocationResult, ToolParameter # Added
 from b4a_config import B4ALoader, MCPConfig, RSSConfig, resolve_value
@@ -44,14 +46,19 @@ except ImportError:
 
 logger = structlog.get_logger(__name__)
 
+# Define a constant namespace UUID for generating channel-specific history keys
+# Generated one-time by Uche using uuid.uuid4()
+DISCORD_CHANNEL_HISTORY_NAMESPACE = uuid.UUID('faa9e9c4-1f01-4e27-933d-6460b8924924')
+
 ALLOWED_FOR_LLM_INIT = ['base_url', 'api_key'] # Adjusted for openai > 1.0
 ALLOWED_FOR_LLM_CHAT = ['model', 'temperature', 'max_tokens', 'top_p'] # Added common chat params
 
 # API Key Handling - ensure OPENAI_API_KEY is checked/set if needed by the AsyncOpenAI client
 # The logic in __init__ already handles this using the config/env var.
 
+os.environ['TOKENIZERS_PARALLELISM'] = 'false' # Disable parallelism for tokenizers to avoid warnings
 
-# Helper Function for Message Splitting (Unchanged from provided code)
+# Helper Function for Message Splitting
 async def send_long_message(sendable: Union[commands.Context, discord.Interaction, discord_abc.Messageable], content: str, followup: bool = False, ephemeral: bool = False):
     '''
     Sends a message, splitting it into multiple parts if it exceeds Discord's limit.
@@ -124,7 +131,7 @@ async def send_long_message(sendable: Union[commands.Context, discord.Interactio
 
 
 class MCPCog(commands.Cog):
-    def __init__(self, bot: commands.Bot, config: dict[str, Any], b4a_data: B4ALoader):
+    def __init__(self, bot: commands.Bot, config: dict[str, Any], b4a_data: B4ALoader, pgvector_config: dict[str, Any]):
         self.bot = bot
         self.config = config # Agent config (LLM, etc.)
         self.b4a_data = b4a_data     # Loaded B4A source data
@@ -134,6 +141,10 @@ class MCPCog(commands.Cog):
 
         self._connection_tasks: dict[str, asyncio.Task] = {}
         self._shutdown_event = asyncio.Event()
+
+        self.pgvector_config = pgvector_config
+        self.pgvector_db: Optional[MessageDB] = None
+        self.pgvector_enabled = self.pgvector_config.get('enabled', False)
 
         # LLM Client and Parameter Initialization
         llm_endpoint_config = self.config.get('llm_endpoint', {})
@@ -176,7 +187,10 @@ class MCPCog(commands.Cog):
         # Log B4A Loading Summary
         if self.b4a_data.load_errors:
             logger.warning('Errors occurred during B4A source loading.', count=len(self.b4a_data.load_errors), errors=self.b4a_data.load_errors)
-        logger.info('MCP Cog initialized.', mcp_sources_found=len(self.b4a_data.mcp_sources), rss_sources_found=len(self.b4a_data.rss_sources))
+        logger.info('MCP Cog initialized',
+            mcp_sources_found=len(self.b4a_data.mcp_sources),
+            rss_sources_found=len(self.b4a_data.rss_sources),
+            pgvector_enabled=self.pgvector_enabled)
 
     async def _manage_mcp_connection(self, mcp_config: MCPConfig):
         '''Persistent task to manage a single MCP connection using MCPClient.'''
@@ -259,6 +273,41 @@ class MCPCog(commands.Cog):
         logger.info('Loading MCPCog and starting connection managers…')
         self._shutdown_event.clear() # Ensure shutdown is not set initially
 
+        if self.pgvector_enabled and self.pgvector_db is None:
+            logger.info('Initializing PGVector MessageDB connection...')
+            try:
+                if self.pgvector_config['conn_str']:
+                    # Use connection string if provided
+                    self.pgvector_db = await MessageDB.from_conn_string(
+                        self.pgvector_config['conn_str'],
+                        self.pgvector_config['embedding_model'],
+                        self.pgvector_config['table_name'],
+                        # stringify_json=False
+                    )
+                else:
+                    self.pgvector_db = await MessageDB.from_conn_params(
+                        embedding_model=self.pgvector_config['embedding_model'],
+                        table_name=self.pgvector_config['table_name'],
+                        db_name=self.pgvector_config['db_name'],
+                        host=self.pgvector_config['host'],
+                        port=self.pgvector_config['port'],
+                        user=self.pgvector_config['user'],
+                        password=self.pgvector_config['password']
+                    )
+                try:
+                    # Might not be running as superuser, so don't assume table creation is possible
+                    # await self.pgvector_db.create_table()
+                    logger.info(f'PGVector table "{self.pgvector_config["table_name"]}" ensured.')
+                except Exception as table_err:
+                    # Log error, but maybe don't disable PGVector entirely if table exists
+                    logger.exception(f'Error ensuring PGVector table exists (it might already exist): {table_err}')
+
+                logger.info('PGVector MessageDB connection successful.')
+            except Exception as e:
+                logger.exception('Failed to initialize PGVector MessageDB connection during cog_load. Disabling PGVector.')
+                self.pgvector_enabled = False
+                self.pgvector_db = None
+
         mcp_source_configs = self.b4a_data.mcp_sources # Get sources from B4A data
         if not mcp_source_configs:
             logger.warning('No valid @mcp B4A sources loaded. No MCP connections will be established.')
@@ -283,6 +332,7 @@ class MCPCog(commands.Cog):
         '''
         Clean up MCP connections when the cog is unloaded by stopping tasks.
         '''
+        # XXX Shouldn't be eny PGVector Cleanup needed, but maybe set self.pgvector_db to None?
         logger.info('Unloading MCPCog and stopping connection tasks…')
         self._shutdown_event.set() # Signal all tasks to stop their loops
 
@@ -320,6 +370,60 @@ class MCPCog(commands.Cog):
         self.mcp_tools.clear()
         self._connection_tasks.clear() # Clear the task references
         logger.info('MCPCog unloaded and connection resources cleared.')
+
+    async def _get_channel_history(self, channel_id: int) -> list[dict[str, Any]]:
+        '''
+        Get message history for a channel. Prioritizes PGVector if enabled,
+        falls back to in-memory cache.
+        '''
+        # Generate deterministic UUIDv5 from channel ID
+        history_key = uuid.uuid5(DISCORD_CHANNEL_HISTORY_NAMESPACE, str(channel_id))
+
+        if self.pgvector_enabled and self.pgvector_db:
+            logger.debug(f'Retrieving history from PGVector for key: {history_key}')
+            try:
+                # Retrieve messages from PGVector
+                # FIXME: Set limit in config
+                pg_messages_gen = await self.pgvector_db.get_messages(history_key=history_key, limit=20)
+                # Convert generator to list and reverse it to get chronological order
+                pg_messages = list(pg_messages_gen)
+                pg_messages.reverse() # Reverse to chronological
+
+                # Format for LLM (ensure 'role' and 'content' keys)
+                formatted_history = []
+                # Check if system message needs to be prepended manually or if it's stored
+                # Assuming it IS stored as the first message during insertion.
+                # If not, prepend: formatted_history = [{'role': 'system', 'content': self.system_message}]
+                import pprint; pprint.pprint(pg_messages)
+                for msg in pg_messages:
+                    formatted_history.append({'role': msg['role'], 'content': msg['content']})
+
+                logger.debug(f'Retrieved {len(formatted_history)} messages from PGVector for key {history_key}')
+                # Optional: Update in-memory cache as well? Or rely solely on DB?
+                # For simplicity, let's just return the DB result.
+                # self.message_history[channel_id] = formatted_history # Update cache
+                return formatted_history
+            except Exception as e:
+                logger.exception(f'Error retrieving history from PGVector for key {history_key}. Falling back to in-memory.')
+                # Fall through to use in-memory cache on error
+
+        # Fallback to in-memory cache if PGVector disabled, errored, or not initialized
+        logger.debug(f'Using in-memory history cache for channel {channel_id}')
+        max_history_len = self.config.get('max_history_length', 20)
+        if channel_id not in self.message_history:
+            self.message_history[channel_id] = [
+                {'role': 'system', 'content': self.system_message}
+            ]
+            logger.info(f'Initialized in-memory message history for channel {channel_id}')
+        else:
+            current_len = len(self.message_history[channel_id])
+            target_len = max_history_len + 1 # Keep system message + N history items
+            if current_len > target_len:
+                amount_to_remove = current_len - target_len
+                self.message_history[channel_id] = [self.message_history[channel_id][0]] + self.message_history[channel_id][amount_to_remove + 1:]
+                logger.debug(f'Trimmed in-memory message history for channel {channel_id}, removed {amount_to_remove} messages.')
+
+        return self.message_history[channel_id]
 
     async def execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> Union[ToolInvocationResult, dict[str, str]]:
         '''
@@ -408,7 +512,6 @@ class MCPCog(commands.Cog):
                  logger.warning('ToolInvocationResult received with None content.', tool_name=tool_name_attr, error_code=result.error_code) # Assuming tool_name exists
                  return f'Tool executed successfully but returned no content.'
 
-            # *** ADDED: Handle specific MCP text content structure ***
             if isinstance(content, dict) and content.get('type') == 'text' and 'text' in content:
                  text_content = content['text']
                  # Return the text directly, converting simple types to string
@@ -435,28 +538,6 @@ class MCPCog(commands.Cog):
             # Gracefully handle unexpected types
             logger.warning('Unexpected format received in format_calltoolresult_content', received_result=result)
             return f'Unexpected tool result format: {str(result)[:200]}'
-
-    def get_channel_history(self, channel_id: int) -> list[dict[str, Any]]:
-        '''
-        Get message history for a channel, or initialize if not exists.
-        Includes basic history length management.
-        '''
-        max_history_len = self.config.get('max_history_length', 20)
-        if channel_id not in self.message_history:
-            self.message_history[channel_id] = [
-                {'role': 'system', 'content': self.system_message}
-            ]
-            logger.info(f'Initialized message history for channel {channel_id}')
-        else:
-             current_len = len(self.message_history[channel_id])
-             target_len = max_history_len + 1 # Keep system message + N history items
-             if current_len > target_len:
-                 amount_to_remove = current_len - target_len
-                 # Keep system message ([0]) + last `max_history_len` messages
-                 self.message_history[channel_id] = [self.message_history[channel_id][0]] + self.message_history[channel_id][amount_to_remove + 1:]
-                 logger.debug(f'Trimmed message history for channel {channel_id}, removed {amount_to_remove} messages. New length: {len(self.message_history[channel_id])}.')
-
-        return self.message_history[channel_id]
 
     def _map_mcp_type_to_json_type(self, mcp_type: str) -> str:
         """Maps MCP parameter types to JSON Schema types."""
@@ -558,7 +639,6 @@ class MCPCog(commands.Cog):
 
         return openai_tools
 
-
     async def _handle_chat_logic(
         self,
         sendable: Union[commands.Context, discord.Interaction, discord_abc.Messageable],
@@ -571,6 +651,8 @@ class MCPCog(commands.Cog):
         '''
         Core logic for handling chat interactions, LLM calls, and tool execution,
         plus basic attachment handling.
+
+        Includes PGVector insertion if enabled, using deterministic UUIDv5 based on channel_id.
         '''
         # Determine if we need to use followup/ephemeral (only for Interactions)
         is_interaction = isinstance(sendable, discord.Interaction)
@@ -579,6 +661,8 @@ class MCPCog(commands.Cog):
         # Ephemeral only makes sense for interactions
         can_be_ephemeral = is_interaction
         processed_message = message # Start with the original text message
+
+        history_key = uuid.uuid5(DISCORD_CHANNEL_HISTORY_NAMESPACE, str(channel_id)) # Generate UUID key once
 
         # Attachment Handling
         if attachments:
@@ -644,9 +728,38 @@ class MCPCog(commands.Cog):
 
         try:
             # Get and update history
-            channel_history = self.get_channel_history(channel_id)
-            channel_history.append({'role': 'user', 'content': processed_message})
-            logger.debug(f'User message added to history for channel {channel_id}', user_id=user_id, stream=stream)
+            channel_history = await self._get_channel_history(channel_id)
+
+            # If history was just initialized (only contains system message) and PGVector is on, store system message.
+            # Do we want to store the system message in the DB?
+            # if self.pgvector_enabled and self.pgvector_db and len(channel_history) == 1 and channel_history[0]['role'] == 'system':
+            #      try:
+            #          logger.debug(f'Storing initial system message to PGVector for key: {history_key}')
+            #          await self.pgvector_db.insert(
+            #              history_key=history_key,
+            #              role='system',
+            #              content=channel_history[0]['content'],
+            #              metadata={'user_id': 'system'} # Example metadata
+            #          )
+            #      except Exception as e:
+            #          logger.exception(f'Failed to store initial system message to PGVector for key {history_key}.')
+
+            user_message_dict = {'role': 'user', 'content': processed_message}
+            channel_history.append(user_message_dict)
+            logger.debug(f'User message added to history for channel {channel_id}')
+
+            if self.pgvector_enabled and self.pgvector_db:
+                try:
+                    logger.debug(f'Storing user message to PGVector for key: {history_key}')
+                    metadata = {'user_id': str(user_id), 'discord_role': 'user'}
+                    await self.pgvector_db.insert(
+                        history_key=history_key,
+                        role='user', # Store standard role
+                        content=processed_message,
+                        metadata=metadata
+                    )
+                except Exception as e:
+                    logger.exception(f'Failed to store user message to PGVector for key {history_key}.')
 
             # Prepare chat parameters (Combine endpoint & explicit settings)
             # Use the consolidated self.llm_chat_params
@@ -659,7 +772,7 @@ class MCPCog(commands.Cog):
             else:
                  logger.debug(f'No active tools available for LLM call for channel {channel_id}')
 
-            # LLM Call & Response Handling
+            # LLM call & response handling, including tool calls
             initial_response_content = ''
             tool_calls_aggregated: list[dict[str, Any]] = []
             assistant_message_dict: dict[str, Any] = {'role': 'assistant', 'content': None}
@@ -710,7 +823,7 @@ class MCPCog(commands.Cog):
                 await send_long_message(sendable, f'⚠️ Unexpected error communicating with AI: {str(e)}', followup=send_followup, ephemeral=can_be_ephemeral)
                 return
 
-            # Send Initial Response & Update History (Unchanged)
+            # Send Initial Response & Update History
             sent_initial_message = False
             if initial_response_content.strip():
                 logger.debug(f'Sending initial LLM response to channel {channel_id}', length=len(initial_response_content), stream=stream)
@@ -725,12 +838,36 @@ class MCPCog(commands.Cog):
 
             if assistant_message_dict.get('content') or assistant_message_dict.get('tool_calls'):
                 channel_history.append(assistant_message_dict)
+                sent_initial_message = True # Flag if we added *something* from the assistant
+
+                # PGVector Insertion: Assistant Message / Tool Call Request
+                if self.pgvector_enabled and self.pgvector_db:
+                    try:
+                        logger.debug(f'Storing assistant message/tool request to PGVector for key: {history_key}')
+
+                        # Ensure content is not None before insertion
+                        db_content = assistant_message_dict.get('content')
+                        content_to_insert = db_content if db_content is not None else ''
+
+                        metadata = {'user_id': str(self.bot.user.id), 'discord_role': 'assistant'}
+                        if assistant_message_dict.get('tool_calls'):
+                            metadata['tool_calls'] = assistant_message_dict['tool_calls'] # Store tool calls in metadata
+
+                        await self.pgvector_db.insert(
+                            history_key=history_key,
+                            role='assistant', # Standard role
+                            content=content_to_insert,
+                            metadata=metadata
+                        )
+                    except Exception as e:
+                        logger.exception(f'Failed to store assistant message/tool request to PGVector for key {history_key}.')
+
             elif not sent_initial_message:
                 logger.info(f'LLM call finished for channel {channel_id} with no text/tools.', stream=stream)
                 await send_long_message(sendable, 'I received your message but didn\'t have anything specific to add or do.', followup=send_followup, ephemeral=can_be_ephemeral)
                 return
 
-            # Process Tool Calls (Using updated execute_tool and formatters)
+            # Process Tool Calls
             if tool_calls_aggregated:
                 tool_results_for_history = []
 
@@ -769,6 +906,28 @@ class MCPCog(commands.Cog):
                         tool_result_content_formatted = self.format_calltoolresult_content(tool_result_obj)
                         tool_result_content_for_llm = tool_result_content_formatted # Send formatted result back to LLM
 
+                        tool_result_dict = {
+                            'role': 'tool',
+                            'tool_call_id': tool_call_id,
+                            'name': tool_name,
+                            'content': tool_result_content_for_llm
+                        }
+                        tool_results_for_history.append(tool_result_dict)
+
+                        # PGVector Insertion: Tool Result
+                        if self.pgvector_enabled and self.pgvector_db:
+                            try:
+                                logger.debug(f'Storing tool result ({tool_name}) to PGVector for key: {history_key}')
+                                metadata = {'user_id': 'tool_executor', 'discord_role': 'tool', 'tool_name': tool_name, 'tool_call_id': tool_call_id}
+                                await self.pgvector_db.insert(
+                                    history_key=history_key,
+                                    role='tool',
+                                    content=tool_result_content_for_llm, # Store formatted result
+                                    metadata=metadata
+                                )
+                            except Exception as e:
+                                logger.exception(f'Failed to store tool result ({tool_name}) to PGVector for key {history_key}.')
+
                         # Send result back to user (non-ephemeral)
                         await send_long_message(sendable, f'```Tool Call: {tool_name}\nResult:\n{tool_result_content_formatted}```', followup=True)
                         send_followup = True
@@ -788,7 +947,7 @@ class MCPCog(commands.Cog):
                         'content': tool_result_content_for_llm
                     })
 
-                # Follow-up LLM Call (Unchanged logic)
+                # Follow-up LLM Call
                 if tool_results_for_history:
                     channel_history.extend(tool_results_for_history)
                     logger.debug(f'Added {len(tool_results_for_history)} tool results to history for channel {channel_id}')
@@ -824,7 +983,22 @@ class MCPCog(commands.Cog):
                     if follow_up_text.strip():
                         logger.debug(f'Sending follow-up LLM response to channel {channel_id}', length=len(follow_up_text), stream=stream)
                         await send_long_message(sendable, follow_up_text, followup=True) # Must be followup
-                        channel_history.append({'role': 'assistant', 'content': follow_up_text})
+                        follow_up_dict = {'role': 'assistant', 'content': follow_up_text}
+                        channel_history.append(follow_up_dict)
+
+                        if self.pgvector_enabled and self.pgvector_db:
+                            try:
+                                logger.debug(f'Storing follow-up assistant message to PGVector for key: {history_key}')
+                                metadata = {'user_id': str(self.bot.user.id), 'discord_role': 'assistant'}
+                                await self.pgvector_db.insert(
+                                    history_key=history_key,
+                                    role='assistant',
+                                    content=follow_up_text,
+                                    metadata=metadata
+                                )
+                            except Exception as e:
+                                logger.exception(f'Failed to store follow-up assistant message to PGVector for key {history_key}.')
+
                     else:
                         logger.info(f'LLM follow-up call finished for channel {channel_id} with no text content.', stream=stream)
 
@@ -944,8 +1118,6 @@ class MCPCog(commands.Cog):
         await send_long_message(interaction, message.strip() or 'No B4A sources found or configured.', followup=True)
 
     # Chat Commands (Prefix and Slash)
-    # These commands use _handle_chat_logic, so changes there are inherited.
-    # No structural changes needed here unless specific command behavior changes.
 
     # Prefix form
     @commands.command(name='chat', help='Chat with the AI assistant (Prefix Command)')
@@ -988,9 +1160,9 @@ class MCPCog(commands.Cog):
         if isinstance(error, commands.CommandOnCooldown):
             await ctx.send(f'⏳ Woah there! This command is on cooldown. Try again in {error.retry_after:.1f} seconds.', delete_after=10)
         elif isinstance(error, commands.MissingRequiredArgument):
-             await ctx.send(f'⚠️ You need to provide a message! Usage: `{ctx.prefix}chat <your message>`')
+            await ctx.send(f'⚠️ You need to provide a message! Usage: `{ctx.prefix}chat <your message>`')
         elif isinstance(error, commands.NoPrivateMessage): # Should be caught by the check in the command now
-             await ctx.send('This prefix command cannot be used in DMs. Just send your message directly!')
+            await ctx.send('This prefix command cannot be used in DMs. Just send your message directly!')
         else:
             logger.error(f'Error in prefix command chat_command dispatch: {error}', exc_info=error)
             # Avoid sending generic error here if _handle_chat_logic sends its own
@@ -1047,8 +1219,8 @@ class MCPCog(commands.Cog):
         if isinstance(error, app_commands.CommandOnCooldown):
             error_message = f'⏳ Woah there! This command is on cooldown. Try again in {error.retry_after:.1f} seconds.'
         elif isinstance(error, app_commands.CheckFailure):
-             error_message = 'You don\'t have the necessary permissions or conditions met to use this command.'
-             logger.warning(f"CheckFailure for /chat by {interaction.user}: {error}")
+            error_message = 'You don\'t have the necessary permissions or conditions met to use this command.'
+            logger.warning(f"CheckFailure for /chat by {interaction.user}: {error}")
         # elif isinstance(error, app_commands.NoPrivateMessage): # If we added a guild_only check
         #      error_message = 'This command cannot be used in Direct Messages.'
         else:
@@ -1059,11 +1231,11 @@ class MCPCog(commands.Cog):
         # Try to send the error message using followup if deferred, or initial response otherwise
         try:
             if interaction.response.is_done():
-                 await interaction.followup.send(error_message, ephemeral=ephemeral)
+                await interaction.followup.send(error_message, ephemeral=ephemeral)
             else:
-                 # This case implies defer() failed or the error occurred before defer()
-                 await interaction.response.send_message(error_message, ephemeral=ephemeral)
+                # This case implies defer() failed or the error occurred before defer()
+                await interaction.response.send_message(error_message, ephemeral=ephemeral)
         except discord.HTTPException as e:
             logger.error(f'Failed to send slash command error message for interaction {interaction.id}: {e}')
         except Exception as e:
-             logger.error(f'Generic exception sending slash command error for interaction {interaction.id}: {e}')
+            logger.error(f'Generic exception sending slash command error for interaction {interaction.id}: {e}')

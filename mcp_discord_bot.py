@@ -17,6 +17,7 @@ import discord
 from discord.ext import commands
 import rich.traceback
 import structlog
+from sentence_transformers import SentenceTransformer
 
 from mcp_cog import MCPCog
 # Import the B4A loader function and loader class
@@ -188,10 +189,56 @@ def main(
 
     bot = commands.Bot(command_prefix=['!'], intents=intents, description='MCP Discord Bot')
 
+    # Check environment variables for PGVector settings
+    pgvector_enabled = os.environ.get('AIBOT_PGVECTOR_HISTORY_ENABLED', 'false').lower() == 'true'
+    pgvector_config = None
+    embedding_model = None # Add this line
+
+    if pgvector_enabled:
+        logger.info('PGVector history is ENABLED via environment variable.')
+        try:
+            # Use resolve_value for potential env var in model name?
+            embedding_model_name = os.environ.get('AIBOT_PG_EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
+            logger.info(f'Loading sentence transformer model: {embedding_model_name}')
+            embedding_model = SentenceTransformer(embedding_model_name)
+            logger.info('Sentence transformer model loaded.')
+
+            pgvector_config = {
+                'enabled': True,
+                'embedding_model': embedding_model, # Pass the loaded model object
+                'conn_str': os.environ.get('AIBOT_PG_CONNECT_STRING'),
+                'table_name': os.environ.get('AIBOT_PG_TABLE_NAME', 'discord_chat_history'),
+                'db_name': os.environ.get('AIBOT_PG_DB_NAME'),
+                'host': os.environ.get('AIBOT_PG_HOST', 'localhost'),
+                'port': int(os.environ.get('AIBOT_PG_PORT', 5432)),
+                'user': os.environ.get('AIBOT_PG_USER'),
+                'password': os.environ.get('AIBOT_PG_PASSWORD'),
+            }
+            if not pgvector_config['conn_str']:
+                # Validate required PGVector env vars are present
+                required_pg_vars = ['AIBOT_PG_DB_NAME', 'AIBOT_PG_USER', 'AIBOT_PG_PASSWORD']
+                missing_vars = [var for var in required_pg_vars if not os.environ.get(var)]
+                if missing_vars:
+                    logger.error(f'PGVector enabled, but missing required environment variables: {missing_vars}. Disabling.')
+                    pgvector_config['enabled'] = False # Disable if config is incomplete
+                    pgvector_enabled = False
+
+        except ImportError:
+            logger.error('PGVector enabled, but required libraries (ogbujipt, sentence_transformers, asyncpg, pgvector?) are not installed. Disabling.')
+            pgvector_enabled = False
+            pgvector_config = {'enabled': False}
+        except Exception as e:
+            logger.exception('Error initializing PGVector configuration or loading embedding model. Disabling PGVector history.')
+            pgvector_enabled = False
+            pgvector_config = {'enabled': False}
+    else:
+        logger.info('PGVector history is DISABLED.')
+        pgvector_config = {'enabled': False}
+
     logger.info('Initializing MCPCog…')
     try:
-        # Pass the main config AND the loaded B4A data to the Cog
-        mcp_cog = MCPCog(bot, main_config, b4a_data)
+        # Pass main config, loaded B4A data & chat history DB config
+        mcp_cog = MCPCog(bot, main_config, b4a_data, pgvector_config)
     except Exception as e:
         logger.critical(f'Failed to initialize MCPCog: {e}', exc_info=True)
         sys.exit(1)
