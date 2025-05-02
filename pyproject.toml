@@ -1,17 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "discord-ai-agent"
-version = "0.0.2"
-description = "Add your description here"
+# dynamic = ["version"]
+version = "0.0.3"
+description = "Discord bot for supporting AI/LLM chat applications powered by the Model Context Protocol (MCP), allowing for numerous integrations"
 readme = "README.md"
 requires-python = ">=3.12"
+
+license = "Apache-2.0"
+keywords = []
+authors = [
+  { name = "Uche Ogbuji", email = "uche@ogbuji.net" },
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+
 dependencies = [
     "discord>=2.3.2",
     "fire>=0.7.0",
-    "mcp>=1.6.0",
+    # "mcp>=1.6.0",
     "ogbujipt>=0.9.6",
     "rich>=14.0.0",
     "structlog>=25.2.0",
+    "httpx>=0.25.0", # Added httpx
+    # "mcp-sse-client @ git+https://github.com/zanetworker/mcp-sse-client-python.git@f397a8e", # Added git dependency
 ]
 
 [tool.poetry.dependencies]  # Uses new PEP 508 format. Pulling from GitHub because package is not yet on PyPI
 mcp-sse-client = "https://github.com/zanetworker/mcp-sse-client-python.git#f397a8e"
+
+# Optional dependencies
+[project.optional-dependencies]
+rss = [
+    "feedparser>=6.0.11",
+]
+
+[project.urls]
+Documentation = "https://github.com/OoriData/Discord-AI-Agent#readme"
+Issues = "https://github.com/OoriData/Discord-AI-Agent/issues"
+Source = "https://github.com/OoriData/Discord-AI-Agent"
+
+# [tool.hatch.version]
+# path = "pylib/__about__.py"
+
+# # Rewriting path in distribution
+# [tool.hatch.build.sources]
+# "pylib" = "discord_aiagent"
+# # "resources" = "discord_aiagent/resources"
+
+# [tool.hatch.build.targets.wheel]
+# only-include = ["pylib", "resources"]
+
+# [tool.hatch.build.targets.wheel.sources]
+# "pylib" = "discord_aiagent"
+# "resources" = "discord_aiagent/resources"

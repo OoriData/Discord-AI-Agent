@@ -40,6 +40,7 @@ B4ASourceConfig = Union[  # For hinting
 # XXX: Use google.re2 to avoid backtracking attachs?
 ENV_VAR_PATTERN = re.compile(r'^\$([a-zA-Z_][a-zA-Z0-9_]*)$')
 
+
 def resolve_value(value: Any) -> Any:
     '''Resolves values, checking for $ENV_VAR patterns.'''
     if isinstance(value, str):

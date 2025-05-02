@@ -12,14 +12,22 @@ cp config/example.main.toml config/main.toml
 
 Then edit `main.toml` as needed. It specifies your LLM endpoint and model context resources such as MCP servers.
 
+Follow the same pattern with `config/*news*.example.b4a.toml` depending on what context tools you plan to use, e.g.
+
+```sh
+cp config/toys.example.b4a.toml config/toys.b4a.toml
+```
+
 # Running
 
 If you included `toys.b4a.toml` in your `main.toml` you'll need to have that MCP server running. In a separate terminal `cd demo_server` then run
 
 ```sh
-uv pip install -Ur requirements.txt
+uv pip install -Ur requirements.txt --constraint=constraints.txt
 uvicorn toy_mcp_server:create_app --factory --host 127.0.0.1 --port 8902
 ```
+
+To use a different port, make sure you also update the `b4a.toml` file
 
 Make sure you set up any other MCP or other resources you've specified in your B4A. Now you can run the bot.
 
@@ -39,6 +47,14 @@ export AIBOT_DISCORD_TOKEN="YOUR_TOKEN"
 export AIBOT_DISCORD_CONFIG_PATH="./config"
 python mcp_discord_bot.py # Reads from env vars
 ```
+
+# Sample queries
+
+# From the toy MCP servers
+
+* Ask the magic 8-ball if I should deploy to production on Friday
+* Consult the magic 8-ball about my chances of winning the lottery
+* Magic 8-ball, tell me: will it rain tomorrow?
 
 ## PGVector chat history
 

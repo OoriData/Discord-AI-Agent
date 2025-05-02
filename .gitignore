@@ -1,4 +1,7 @@
-config/main.toml
+config/*.toml
+!config/*example.*.toml
+
+# config/main.toml
 
 # Used by Pywright Python Language Server (e.g. Zed editor)
 pyrightconfig.json

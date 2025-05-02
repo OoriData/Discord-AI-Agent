@@ -6,10 +6,8 @@ Provides basic tools like add, echo, and a simulated long task.
 # How to run:
 uvicorn demo_server.toy_mcp_server:create_app --factory --host 127.0.0.1 --port 8902
 '''
-from __future__ import annotations
-
 import asyncio
-from typing import Any
+import random
 
 import uvicorn
 from fastapi import FastAPI
@@ -17,9 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from mcp.server.fastmcp import FastMCP
 import mcp.server.fastmcp
-from sse_server_vendored import VendoredSseServerTransport
-mcp.server.fastmcp.SseServerTransport = VendoredSseServerTransport
-# Vendored from MCP SDK: mcp.client.sse
+# from sse_server_vendored import VendoredSseServerTransport
+# mcp.server.fastmcp.SseServerTransport = VendoredSseServerTransport  # Vendored from MCP SDK: mcp.client.sse
 
 import structlog
 logger = structlog.get_logger(__name__)
@@ -39,7 +36,8 @@ mcp = FastMCP(
     version=TOY_SERVER_VERSION,
     description=TOY_SERVER_DESCRIPTION,
     context={}, # No shared context needed for these tools
-    auto_mount=False
+    auto_mount=False,
+    auth_backend=None
 )
 
 @mcp.tool()
@@ -51,13 +49,19 @@ async def add(a: int, b: int) -> int:
     return result
 
 @mcp.tool()
-async def echo(text: str, repeat: int = 1) -> str:
-    '''Echoes the provided text a specified number of times.'''
-    logger.info('Executing `echo` tool', text=text, repeat=repeat)
-    if repeat < 1:
-        raise ValueError('Repeat count must be at least 1')
-    result = ' '.join([text] * repeat)
-    logger.info('Result of `echo`', result=result)
+async def magic_8_ball(question: str = 'Your question') -> str:
+    '''Consult the Magic 8-Ball for a glimpse into the future! (Question is ignored).'''
+    logger.info('Executing `magic_8_ball` tool', question=question)
+    answers = [
+        'It is certain.', 'It is decidedly so.', 'Without a doubt.', 'Yes – definitely.',
+        'You may rely on it.', 'As I see it, yes.', 'Most likely.', 'Outlook good.',
+        'Yes.', 'Signs point to yes.', 'Reply hazy, try again.', 'Ask again later.',
+        'Better not tell you now.', 'Cannot predict now.', 'Concentrate and ask again.',
+        'Don\'t count on it.', 'My reply is no.', 'My sources say no.', 'Outlook not so good.',
+        'Very doubtful.'
+    ]
+    result = random.choice(answers)
+    logger.info('Result of `magic_8_ball`', answer=result)
     return result
 
 @mcp.tool()

@@ -1,0 +1,14 @@
+# news.b4a.toml
+# Describes a simple direct integration - an RSS feed data source.
+
+[[context_source]]
+name = "example_news_feed"
+description = "Provides latest headlines from Example News"
+type = "@rss" # REQUIRED: Specifies the integration handler type.
+
+# Configuration specific to the '.rss' handler:
+url = "https://www.example.com/rss/news" # REQUIRED: The URL of the feed.
+
+# Optional configuration for the handler:
+# refresh_interval = "1h" # Example: How often the agent should check for updates.
+# max_items = 10 # Example: Limit the number of items processed.

@@ -8,6 +8,7 @@ import json
 import asyncio
 from typing import Any, Union, Optional
 import uuid
+import time
 # import traceback
 
 import discord
@@ -22,13 +23,14 @@ from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceD
 from ogbujipt.embedding.pgvector import MessageDB
 
 from mcp_sse_client import MCPClient, ToolDef, ToolInvocationResult, ToolParameter # Added
-from b4a_config import B4ALoader, MCPConfig, RSSConfig, resolve_value
+from b4a_config import B4ALoader, MCPConfig, resolve_value
+from source_handlers import fetch_and_parse_rss, FEEDPARSER_AVAILABLE # Import the function and flag
 
+# XXX: Clean up exception handling & imports by better study of mcp-sse-client
 # Needed for ClosedResourceError/BrokenResourceError handling if not imported via sse/mcp
 # MCPClient might raise its own connection errors or underlying httpx/anyio errors
 # We'll catch broader exceptions initially and refine if needed.
 try:
-    # Keep these if MCPClient explicitly raises them or underlying libs do.
     from anyio import ClosedResourceError, BrokenResourceError, WouldBlock
 except ImportError:
     class ClosedResourceError(Exception): pass
@@ -67,7 +69,7 @@ async def send_long_message(sendable: Union[commands.Context, discord.Interactio
     max_length = 2000
     start = 0
     # Ensure content is a string, even if it's None or another type unexpectedly
-    content_str = str(content) if content is not None else ""
+    content_str = str(content) if content is not None else ''
     if not content_str.strip(): # Don't try to send empty messages
         logger.debug('Attempted to send empty message.')
         return
@@ -91,9 +93,9 @@ async def send_long_message(sendable: Union[commands.Context, discord.Interactio
                         # This path is less common if defer() is used consistently.
                         try:
                             await sendable.response.send_message(chunk, ephemeral=send_ephemeral)
-                            logger.debug("Sent initial interaction response (unexpected path after deferral).")
+                            logger.debug('Sent initial interaction response (unexpected path after deferral).')
                         except discord.InteractionResponded:
-                            logger.warning("Interaction already responded, but followup wasn't triggered correctly. Sending via followup.")
+                            logger.warning('Interaction already responded, but followup wasn\'t triggered correctly. Sending via followup.')
                             await sendable.followup.send(chunk, ephemeral=send_ephemeral) # Fallback to followup
                     else:
                         await sendable.followup.send(chunk, ephemeral=send_ephemeral)
@@ -146,6 +148,9 @@ class MCPCog(commands.Cog):
         self.pgvector_db: Optional[MessageDB] = None
         self.pgvector_enabled = self.pgvector_config.get('enabled', False)
 
+        self._rss_feed_cache: dict[str, tuple[float, Any]] = {}
+        self._rss_cache_ttl: int = self.config.get('rss_cache_ttl', 300) # Default 5 mins, configurable in agent TOML
+
         # LLM Client and Parameter Initialization
         llm_endpoint_config = self.config.get('llm_endpoint', {})
         model_params_config = self.config.get('model_params', {})
@@ -190,7 +195,8 @@ class MCPCog(commands.Cog):
         logger.info('MCP Cog initialized',
             mcp_sources_found=len(self.b4a_data.mcp_sources),
             rss_sources_found=len(self.b4a_data.rss_sources),
-            pgvector_enabled=self.pgvector_enabled)
+            pgvector_enabled=self.pgvector_enabled,
+            rss_handler_available=FEEDPARSER_AVAILABLE)
 
     async def _manage_mcp_connection(self, mcp_config: MCPConfig):
         '''Persistent task to manage a single MCP connection using MCPClient.'''
@@ -235,7 +241,7 @@ class MCPCog(commands.Cog):
             except Exception as e:
                 # Catch other errors from MCPClient init or list_tools
                 logger.exception(f'Unexpected error managing connection for {name}. Retrying…', server_name=name, url=url)
-                # Optionally log traceback: logger.error("Traceback:", exc_info=True)
+                # Optionally log traceback: logger.error('Traceback:', exc_info=True)
 
             # Cleanup before Reconnect/Shutdown
             logger.debug(f'Cleaning up resources for {name} before retry/shutdown.')
@@ -297,7 +303,7 @@ class MCPCog(commands.Cog):
                 try:
                     # Might not be running as superuser, so don't assume table creation is possible
                     # await self.pgvector_db.create_table()
-                    logger.info(f'PGVector table "{self.pgvector_config["table_name"]}" ensured.')
+                    logger.info(f'PGVector table `{self.pgvector_config['table_name']}` ensured.')
                 except Exception as table_err:
                     # Log error, but maybe don't disable PGVector entirely if table exists
                     logger.exception(f'Error ensuring PGVector table exists (it might already exist): {table_err}')
@@ -368,7 +374,8 @@ class MCPCog(commands.Cog):
         # Clear stored data regardless of task shutdown status
         self.mcp_connections.clear()
         self.mcp_tools.clear()
-        self._connection_tasks.clear() # Clear the task references
+        self._connection_tasks.clear() # Clear task references
+        self._rss_feed_cache.clear()
         logger.info('MCPCog unloaded and connection resources cleared.')
 
     async def _get_channel_history(self, channel_id: int) -> list[dict[str, Any]]:
@@ -425,12 +432,79 @@ class MCPCog(commands.Cog):
 
         return self.message_history[channel_id]
 
+    async def _execute_rss_query(self, tool_input: dict[str, Any]) -> dict[str, str]:
+        '''Handles the execution of the 'query_rss_feed' tool.'''
+        feed_name = tool_input.get('feed_name')
+        query = tool_input.get('query') # Optional query string
+        limit = tool_input.get('limit', 5) # Default limit
+
+        if not feed_name:
+            return {'error': 'Missing required parameter: feed_name'}
+        if not isinstance(limit, int) or limit < 1:
+            limit = 5 # Default to 5 if invalid limit provided
+
+        # Find the RSSConfig
+        rss_conf = next((conf for conf in self.b4a_data.rss_sources if conf.name == feed_name), None)
+        if not rss_conf:
+            return {'error': f'Configured RSS feed named `{feed_name}` not found.'}
+
+        # Fetch and parse using the handler function
+        parsed_feed, error = await fetch_and_parse_rss(rss_conf.url, self._rss_feed_cache, self._rss_cache_ttl)
+
+        if error:
+            return {'error': f'Error fetching feed `{feed_name}`: {error}'}
+        if not parsed_feed or not hasattr(parsed_feed, 'entries'):
+             return {'error': f'Failed to get valid entries from feed `{feed_name}`.'}
+
+        # Filter entries if query is provided
+        matching_entries = []
+        if query:
+            query_lower = query.lower()
+            for entry in parsed_feed.entries:
+                title = entry.get('title', '').lower()
+                summary = entry.get('summary', '').lower()
+                # Basic keyword check in title or summary
+                if query_lower in title or query_lower in summary:
+                    matching_entries.append(entry)
+        else:
+            # No query, use all entries (up to the limit)
+            matching_entries = parsed_feed.entries
+
+        # Limit the results
+        limited_entries = matching_entries[:limit]
+
+        if not limited_entries:
+            result_text = f'No entries found in feed `{feed_name}`'
+            if query: result_text += f' matching query `{query}`'
+            return {'result': result_text}
+
+        # Format the results
+        result_items = []
+        for entry in limited_entries:
+            title = entry.get('title', 'No Title')
+            link = entry.get('link', 'No Link')
+            summary = entry.get('summary', 'No Summary')
+            # Simple formatting, truncate summary
+            summary_short = (summary[:200] + '...') if len(summary) > 200 else summary
+            result_items.append(f'- Title: {title}\n  Link: {link}\n  Summary: {summary_short}')
+
+        final_result = f'Found {len(limited_entries)} entries from feed `{feed_name}`'
+        if query: final_result += f' matching query `{query}`'
+        final_result += ':\n\n' + '\n\n'.join(result_items)
+
+        return {'result': final_result}
+
     async def execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> Union[ToolInvocationResult, dict[str, str]]:
         '''
-        Execute an MCP tool using a managed MCPClient instance.
-        Returns ToolInvocationResult on success, or an error dictionary.
+        Execute an MCP tool or the RSS query tool.
+        Returns ToolInvocationResult for MCP tools, or a dict for RSS/errors.
         '''
         logger.debug('Executing tool', tool_name=tool_name, tool_input=tool_input)
+
+        if tool_name == 'query_rss_feed':
+            if not FEEDPARSER_AVAILABLE:
+                return {'error': 'RSS querying is disabled because the `feedparser` library is not installed.'}
+            return await self._execute_rss_query(tool_input)
 
         mcp_client: Optional[MCPClient] = None
         server_name_found: Optional[str] = None  # B4A source name
@@ -441,60 +515,60 @@ class MCPCog(commands.Cog):
             if source_name in self.mcp_tools and any(tool.name == tool_name for tool in self.mcp_tools[source_name]):
                 mcp_client = client
                 server_name_found = source_name
-                logger.debug(f'Found active client for tool \'{tool_name}\' on MCP source \'{server_name_found}\'.')
+                logger.debug(f'Found active client for tool `{tool_name}` on MCP source \'{server_name_found}\'.')
                 break
 
         if not mcp_client or not server_name_found:
-            logger.warning(f'Tool \'{tool_name}\' not found on any *actively connected* MCP source.')
+            logger.warning(f'MCP Tool `{tool_name}` not found on any *actively connected* MCP source.')
             # Provide more specific error based on B4A data
             if not self.b4a_data.mcp_sources:
-                return {'error': f'Tool \'{tool_name}\' cannot be executed: No @mcp B4A sources configured.'}
+                return {'error': f'Tool `{tool_name}` cannot be executed: No @mcp B4A sources configured.'}
             if not self.mcp_connections:
-                return {'error': f'Tool \'{tool_name}\' cannot be executed: No MCP sources currently connected.'}
+                return {'error': f'Tool `{tool_name}` cannot be executed: No MCP sources currently connected.'}
             # Check if tool exists on a configured but disconnected source
             origin_source = next((s.name for s in self.b4a_data.mcp_sources if s.name in self.mcp_tools and any(t.name == tool_name for t in self.mcp_tools[s.name])), None)
             if origin_source and origin_source not in self.mcp_connections:
-                return {'error': f'Tool \'{tool_name}\' exists (on MCP source \'{origin_source}\'), but it\'s currently disconnected.'}
-            return {'error': f'Tool \'{tool_name}\' not found on any configured and connected MCP source.'}
+                return {'error': f'Tool `{tool_name}` exists (on MCP source \'{origin_source}\'), but it\'s currently disconnected.'}
+            return {'error': f'Tool `{tool_name}` not found on any configured and connected MCP source.'}
 
-        logger.info(f'Calling tool "{tool_name}" on MCP server "{server_name_found}"')
+        logger.info(f'Calling MCP tool `{tool_name}` on MCP server `{server_name_found}`')
         try:
             # Call the tool using MCPClient's invoke_tool method
             # Add a timeout for the specific tool call.
             result: ToolInvocationResult = await asyncio.wait_for(
                 mcp_client.invoke_tool(tool_name, tool_input),
-                timeout=120.0
+                timeout=120.0  # FIXME: Make configurable
             )
-            logger.debug(f'Tool "{tool_name}" executed via MCPClient.', result_content=result.content, error_code=result.error_code)
+            logger.debug(f'Tool `{tool_name}` executed via MCPClient.', result_content=result.content, error_code=result.error_code)
 
             # Check for tool-specific errors reported by MCPClient/Server
             # Check specifically for non-zero error codes. Treat None and 0 as success.
             if result.error_code is not None and result.error_code != 0:
-                logger.warning(f'Tool "{tool_name}" executed but reported an error.', error_code=result.error_code, content=result.content)
+                logger.warning(f'Tool `{tool_name}` executed but reported an error.', error_code=result.error_code, content=result.content)
                 # Format the error content for the user/LLM
-                error_message = f"Tool reported error code {result.error_code}"
+                error_message = f'Tool reported error code {result.error_code}'
                 if result.content: # Include content if provided with the error
-                     error_message += f": {str(result.content)}"
+                     error_message += f': {str(result.content)}'
                 return {'error': error_message} # Return standard error dict
 
             # If error_code is None or 0, it's a success
             return result # Return the successful ToolInvocationResult object
 
         except asyncio.TimeoutError:
-             logger.error(f'Timeout calling tool "{tool_name}" on server "{server_name_found}"', tool_input=tool_input)
+             logger.error(f'Timeout calling MCP tool `{tool_name}` on server `{server_name_found}`', tool_input=tool_input)
              # Attempt to trigger reconnect by removing client? Or let manager handle?
              # Let manager handle based on future failures.
-             return {'error': f'Tool call "{tool_name}" timed out.'}
+             return {'error': f'Tool call `{tool_name}` timed out.'}
         except (ConnectError, ReadTimeout, BrokenResourceError, ClosedResourceError, ConnectionError, WouldBlock) as conn_err:
             # Catch connection-related errors during the tool call
-            logger.error(f'Connection error during tool call "{tool_name}" on server "{server_name_found}": {type(conn_err).__name__}', tool_input=tool_input, error=str(conn_err))
+            logger.error(f'Connection error during MCP tool call `{tool_name}` on server `{server_name_found}`: {type(conn_err).__name__}', tool_input=tool_input, error=str(conn_err))
             # Remove the client reference; the management task will handle reconnection.
             if server_name_found in self.mcp_connections: del self.mcp_connections[server_name_found]
             if server_name_found in self.mcp_tools: del self.mcp_tools[server_name_found] # Also clear tools
-            return {'error': f'Connection error executing tool "{tool_name}". The server may be temporarily unavailable. Please try again.'}
+            return {'error': f'Connection error executing MCP tool `{tool_name}`. The server may be temporarily unavailable. Please try again.'}
         except Exception as e:
-            logger.exception(f'Unexpected error calling tool "{tool_name}" on server "{server_name_found}"', tool_input=tool_input)
-            return {'error': f'Error calling tool "{tool_name}": {str(e)}'}
+            logger.exception(f'Unexpected error calling tool `{tool_name}` on server `{server_name_found}`', tool_input=tool_input)
+            return {'error': f'Error calling tool `{tool_name}`: {str(e)}'}
 
     def format_calltoolresult_content(self, result: Union[ToolInvocationResult, dict[str, str]]) -> str:
         '''
@@ -509,13 +583,13 @@ class MCPCog(commands.Cog):
             if content is None:
                  # Assume tool_name attribute exists on ToolInvocationResult based on library structure
                  tool_name_attr = getattr(result, 'tool_name', 'unknown_tool')
-                 logger.warning('ToolInvocationResult received with None content.', tool_name=tool_name_attr, error_code=result.error_code) # Assuming tool_name exists
-                 return f'Tool executed successfully but returned no content.'
+                 logger.warning('MCP ToolInvocationResult received with None content.', tool_name=tool_name_attr, error_code=result.error_code) # Assuming tool_name exists
+                 return 'Tool executed successfully but returned no content.'
 
             if isinstance(content, dict) and content.get('type') == 'text' and 'text' in content:
                  text_content = content['text']
                  # Return the text directly, converting simple types to string
-                 return str(text_content) if text_content is not None else ""
+                 return str(text_content) if text_content is not None else ''
 
             # Handle other types (simple types, lists, other dicts)
             elif isinstance(content, (str, int, float, bool)):
@@ -524,57 +598,65 @@ class MCPCog(commands.Cog):
                 try:
                     # Nicely format other JSON-like structures
                     return json.dumps(content, indent=2)
-                except TypeError:
-                    logger.warning("Could not JSON serialize tool result content.", content_type=type(content))
+                except TypeError as json_err:
+                    logger.warning('Could not JSON serialize MCP tool result content.', content_type=type(content), error=str(json_err))
                     return str(content) # Fallback
             else:
-                logger.warning('Unexpected type for ToolInvocationResult content.', content_type=type(content))
+                logger.warning('Unexpected type for MCP ToolInvocationResult content.', content_type=type(content))
                 return str(content)
 
-        elif isinstance(result, dict) and 'error' in result:
-            # Handle our standardized error format
-            return f'Tool Error: {result["error"]}'
+        elif isinstance(result, dict):
+            # Handle RSS result or any error dict
+            if 'result' in result:
+                return str(result['result']) # Return the formatted RSS result string
+            elif 'error' in result:
+                return f'Tool Error: {result['error']}' # Return formatted error
+            else:
+                # Gracefully handle unexpected dict format
+                logger.warning('Unexpected dict format received in format_calltoolresult_content', received_result=result)
+                try: return json.dumps(result, indent=2)
+                except TypeError: return f'Unexpected tool result format: {str(result)[:200]}'
         else:
             # Gracefully handle unexpected types
             logger.warning('Unexpected format received in format_calltoolresult_content', received_result=result)
             return f'Unexpected tool result format: {str(result)[:200]}'
 
     def _map_mcp_type_to_json_type(self, mcp_type: str) -> str:
-        """Maps MCP parameter types to JSON Schema types."""
+        '''Maps MCP parameter types to JSON Schema types.'''
         # Based on mcp-sse-client ToolParameter.parameter_type which seems to be string
         type_map = {
-            "string": "string",
-            "integer": "integer",
-            "number": "number",
-            "boolean": "boolean",
-            "array": "array", # Assuming direct mapping for array/object might need refinement
-            "object": "object",
+            'string': 'string',
+            'integer': 'integer',
+            'number': 'number',
+            'boolean': 'boolean',
+            'array': 'array', # Assuming direct mapping for array/object might need refinement
+            'object': 'object',
             # Add other mappings if MCP uses different type names
         }
-        json_type = type_map.get(mcp_type.lower(), "string") # Default to string if unknown
+        json_type = type_map.get(mcp_type.lower(), 'string') # Default to string if unknown
         if json_type != mcp_type.lower():
-            logger.debug(f"Mapped MCP type '{mcp_type}' to JSON type '{json_type}'.")
+            logger.debug(f'Mapped MCP type `{mcp_type}` to JSON type `{json_type}`.')
         return json_type
 
     async def format_tools_for_openai(self) -> list[dict[str, Any]]:
         '''
-        Format active MCP tools (from ToolDef) for OpenAI API.
+        Format active MCP tools and the RSS query tool for OpenAI API.
         '''
         openai_tools = []
-        active_server_names = list(self.mcp_connections.keys()) # Use connected clients
+        active_server_names = list(self.mcp_connections.keys())
 
         for server_name in active_server_names:
             if server_name not in self.mcp_tools:
-                logger.warning(f'Server "{server_name}" is connected but has no tools listed. Skipping for OpenAI format.', server_name=server_name)
+                logger.warning(f'Server `{server_name}` is connected but has no tools listed. Skipping for OpenAI format.', server_name=server_name)
                 continue
 
             tool_defs: list[ToolDef] = self.mcp_tools[server_name]
-            logger.debug(f'Formatting {len(tool_defs)} tools from active server "{server_name}" for OpenAI.')
+            logger.debug(f'Formatting {len(tool_defs)} MCP tools from active server `{server_name}` for OpenAI.')
 
             for tool in tool_defs:
                 # Validate ToolDef structure (basic check)
-                if not isinstance(tool, ToolDef) or not tool.name:
-                    logger.warning(f'Skipping malformed/nameless ToolDef from server "{server_name}"', tool_data=tool)
+                if not isinstance(tool, ToolDef) or not hasattr(tool, 'name') or not tool.name:
+                    logger.warning(f'Skipping malformed/nameless ToolDef from server `{server_name}`', tool_data=tool)
                     continue
 
                 # Build JSON schema for parameters
@@ -582,13 +664,13 @@ class MCPCog(commands.Cog):
                 required_params = []
                 if isinstance(tool.parameters, list):
                     for param in tool.parameters:
-                        if not isinstance(param, ToolParameter) or not param.name:
-                            logger.warning(f'Skipping malformed parameter in tool "{tool.name}"', param_data=param)
+                        if not isinstance(param, ToolParameter) or not hasattr(param, 'name') or not param.name:
+                            logger.warning(f'Skipping malformed parameter in tool `{tool.name}`', param_data=param)
                             continue
 
                         param_schema = {
                             'type': self._map_mcp_type_to_json_type(param.parameter_type),
-                            'description': param.description or f"Parameter {param.name}" # Add default desc
+                            'description': param.description or f'Parameter {param.name}' # Add default desc
                         }
                         # Add enum if present (assuming param.enum is a list)
                         if hasattr(param, 'enum') and isinstance(param.enum, list) and param.enum:
@@ -603,13 +685,13 @@ class MCPCog(commands.Cog):
                             # Default to array of strings if item type not specified
                             # MCP ToolParameter needs more info for complex types
                             param_schema['items'] = {'type': 'string'}
-                            logger.debug(f"Using default 'items: string' for array param '{param.name}' in tool '{tool.name}'. Specify item type in MCP if needed.")
+                            logger.debug(f'Using default `items: string` for array param `{param.name}` in tool `{tool.name}`. Specify item type in MCP if needed.')
 
                         # Handle objects (needs 'properties' schema) - Basic handling
                         if param_schema['type'] == 'object':
                             # Need more schema info from MCP ToolParameter for object properties
                             param_schema['properties'] = {}
-                            logger.debug(f"Using default 'properties: {{}}' for object param '{param.name}' in tool '{tool.name}'. Specify properties in MCP if needed.")
+                            logger.debug(f'Using default `properties: {{}}` for object param `{param.name}` in tool `{tool.name}`. Specify properties in MCP if needed.')
 
 
                         properties[param.name] = param_schema
@@ -631,11 +713,48 @@ class MCPCog(commands.Cog):
                     'type': 'function',
                     'function': {
                         'name': tool.name,
-                        'description': tool.description or f"Executes the {tool.name} tool.", # Default desc
+                        'description': tool.description or f'Executes the {tool.name} tool.', # Default desc
                         'parameters': parameters_schema,
                     },
                 }
                 openai_tools.append(openai_tool)
+
+        # Format RSS Query Tool
+        if FEEDPARSER_AVAILABLE and self.b4a_data.rss_sources:
+            rss_feed_names = [conf.name for conf in self.b4a_data.rss_sources]
+            if rss_feed_names:
+                logger.debug(f'Formatting RSS query tool for {len(rss_feed_names)} feeds.')
+                rss_tool_def = {
+                    'type': 'function',
+                    'function': {
+                        'name': 'query_rss_feed',
+                        'description': 'Retrieves the latest entries from a configured RSS feed. Can optionally filter entries by a query string in the title or summary.',
+                        'parameters': {
+                            'type': 'object',
+                            'properties': {
+                                'feed_name': {
+                                    'type': 'string',
+                                    'description': 'The name of the configured RSS feed to query.',
+                                    'enum': rss_feed_names # Use loaded feed names
+                                },
+                                'query': {
+                                    'type': 'string',
+                                    'description': 'Optional: A keyword or phrase to search for in entry titles or summaries.'
+                                },
+                                'limit': {
+                                    'type': 'integer',
+                                    'description': 'Optional: The maximum number of entries to return (default is 5).'
+                                }
+                            },
+                            'required': ['feed_name'] # Only feed_name is strictly required
+                        }
+                    }
+                }
+                openai_tools.append(rss_tool_def)
+            else:
+                 logger.debug('No RSS feed names found, skipping RSS tool formatting.')
+        elif not FEEDPARSER_AVAILABLE and self.b4a_data.rss_sources:
+             logger.warning('RSS sources configured but `feedparser` not installed. RSS tool disabled.')
 
         return openai_tools
 
@@ -649,10 +768,8 @@ class MCPCog(commands.Cog):
         attachments: Optional[list[discord.Attachment]] = None
     ):
         '''
-        Core logic for handling chat interactions, LLM calls, and tool execution,
-        plus basic attachment handling.
-
-        Includes PGVector insertion if enabled, using deterministic UUIDv5 based on channel_id.
+        Core logic for handling chat interactions, LLM calls, and tool execution.
+        Uses PGVector/in-memory history and handles MCP/RSS tools.
         '''
         # Determine if we need to use followup/ephemeral (only for Interactions)
         is_interaction = isinstance(sendable, discord.Interaction)
@@ -723,7 +840,7 @@ class MCPCog(commands.Cog):
                     attachment_texts.append(f'\n\n[Error processing attachment: {attachment.filename}]')
 
             # Prepend attachment contents to the user's message
-            processed_message = "".join(attachment_texts) + "\n\n--- User Message ---\n" + message
+            processed_message = ''.join(attachment_texts) + '\n\n--- User Message ---\n' + message
             logger.debug(f'Added content from {len(attachments)} attachments to the message.')
 
         try:
@@ -762,9 +879,8 @@ class MCPCog(commands.Cog):
                     logger.exception(f'Failed to store user message to PGVector for key {history_key}.')
 
             # Prepare chat parameters (Combine endpoint & explicit settings)
-            # Use the consolidated self.llm_chat_params
             chat_params = {**self.llm_chat_params, 'stream': stream} # Pass stream explicitly
-            openai_tools = await self.format_tools_for_openai()
+            openai_tools = await self.format_tools_for_openai() # Gets both MCP and RSS tools
             if openai_tools:
                 chat_params['tools'] = openai_tools
                 chat_params['tool_choice'] = 'auto'
@@ -890,10 +1006,10 @@ class MCPCog(commands.Cog):
                         try:
                             tool_args = json.loads(arguments_str)
                             if not isinstance(tool_args, dict):
-                                 raise TypeError("Arguments must be a JSON object (dict)")
+                                 raise TypeError('Arguments must be a JSON object (dict)')
                         except (json.JSONDecodeError, TypeError) as json_err:
                             logger.error(f'Failed to decode JSON args or not a dict for tool `{tool_name}`', args_str=arguments_str, tool_call_id=tool_call_id, error=str(json_err))
-                            tool_result_content_for_llm = f'Error: Invalid JSON object arguments provided for tool "{tool_name}". LLM sent: {arguments_str}'
+                            tool_result_content_for_llm = f'Error: Invalid JSON object arguments provided for tool `{tool_name}`. LLM sent: {arguments_str}'
                             await send_long_message(sendable, f'⚠️ Error: Couldn\'t understand arguments for tool `{tool_name}`. LLM provided malformed JSON: `{arguments_str}`', followup=True, ephemeral=can_be_ephemeral)
                             send_followup = True
                             # Append failure result to history
@@ -901,7 +1017,7 @@ class MCPCog(commands.Cog):
                             continue # Skip execution for this tool call
 
                         logger.info(f'Executing tool `{tool_name}` for channel {channel_id}', args=tool_args, tool_call_id=tool_call_id)
-                        tool_result_obj = await self.execute_tool(tool_name, tool_args)
+                        tool_result_obj = await self.execute_tool(tool_name, tool_args) # Handles both MCP and RSS
 
                         tool_result_content_formatted = self.format_calltoolresult_content(tool_result_obj)
                         tool_result_content_for_llm = tool_result_content_formatted # Send formatted result back to LLM
@@ -935,11 +1051,11 @@ class MCPCog(commands.Cog):
                     except Exception as exec_e:
                         # Catch errors from execute_tool or format_calltoolresult_content itself (should be rare now)
                         logger.exception(f'Unexpected error during tool execution/formatting phase for `{tool_name}`', tool_call_id=tool_call_id)
-                        tool_result_content_for_llm = f'Error during tool execution phase for "{tool_name}": {str(exec_e)}'
+                        tool_result_content_for_llm = f'Error during tool execution phase for `{tool_name}`: {str(exec_e)}'
                         await send_long_message(sendable, f'⚠️ Unexpected Error running tool `{tool_name}`: {str(exec_e)}', followup=True, ephemeral=can_be_ephemeral)
                         send_followup = True
 
-                    # Append result to history
+                    # Append result to history (even if it was an error during execution phase)
                     tool_results_for_history.append({
                         'role': 'tool',
                         'tool_call_id': tool_call_id,
@@ -1019,6 +1135,15 @@ class MCPCog(commands.Cog):
     async def on_ready(self):
         ''' Cog ready listener. Connection tasks are started in cog_load. '''
         logger.info(f'Cog {self.__class__.__name__} is ready.')
+        # Log PGVector status after cog is ready and init attempted
+        if self.pgvector_config.get('enabled', False):
+            if self.pgvector_enabled: logger.info('PGVector history persistence is active.')
+            else: logger.warning('PGVector history persistence was configured but failed to initialize. History disabled.')
+        else: logger.info('Using in-memory chat history.')
+        # Log RSS status
+        if self.b4a_data.rss_sources:
+            if FEEDPARSER_AVAILABLE: logger.info('RSS query tool is available.')
+            else: logger.warning('RSS sources configured but `feedparser` not installed. RSS tool disabled.')
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -1037,7 +1162,7 @@ class MCPCog(commands.Cog):
         common_prefixes = ['!', '/', '$', '%', '?', '.', ',']
         if any(message.content.startswith(p) for p in common_prefixes):
             # Optionally, you could inform the user prefixes aren't needed in DMs
-            # await message.channel.send("You don't need a prefix when talking to me in DMs!")
+            # await message.channel.send('You don't need a prefix when talking to me in DMs!')
             logger.debug(f'Ignoring DM from {message.author} starting with a common prefix: {message.content[:10]}...')
             return
 
@@ -1088,14 +1213,15 @@ class MCPCog(commands.Cog):
         message += '\n'
 
         # RSS Sources
+        # Update status based on FEEDPARSER_AVAILABLE
         message += f'**RSS Sources (@rss): {len(self.b4a_data.rss_sources)} configured**\n'
-        if not self.b4a_data.rss_sources:
+        if self.b4a_data.rss_sources:
+            for rss_conf in self.b4a_data.rss_sources:
+                if FEEDPARSER_AVAILABLE: status_icon = '🟢'; status_text = 'Active (Tool Available)'
+                else: status_icon = '⚠️'; status_text = 'Inactive (`feedparser` missing)'
+                message += f'- **{rss_conf.name}**: {status_icon} {status_text} ({rss_conf.url})\n'
+        else:
             message += '  *None configured or loaded.*\n'
-        for rss_conf in self.b4a_data.rss_sources:
-            status_icon = '⚪' # Not actively managed by this cog yet
-            status_text = 'Loaded (Not Active)'
-            # TODO: Add logic here if RSS feeds become actively managed (e.g., fetch status)
-            message += f'- **{rss_conf.name}**: {status_icon} {status_text} ({rss_conf.url})\n'
         message += '\n'
 
         # Unhandled Sources
@@ -1114,8 +1240,75 @@ class MCPCog(commands.Cog):
             for path, err in self.b4a_data.load_errors[:5]: # Show first 5 errors
                 message += f'- `{os.path.basename(path)}`: {err[:150]}…\n'
             if len(self.b4a_data.load_errors) > 5: message += '- … (see logs for more details)\n'
+            message += '\n'
+
+        # PGVector Status
+        message += '**Chat History Storage:**\n'
+        if self.pgvector_config.get('enabled', False):
+            if self.pgvector_enabled: message += '- 🟢 PGVector: **Enabled and Active**\n'
+            else: message += '- 🔴 PGVector: **Configured but FAILED to initialize** (Check logs)\n'
+        else: message += '- ⚪ In-Memory: **Enabled** (PGVector not configured or disabled)\n'
 
         await send_long_message(interaction, message.strip() or 'No B4A sources found or configured.', followup=True)
+
+    @app_commands.command(name='context_details', description='Show detailed status of B4A sources, including available tools.')
+    async def context_details_slash(self, interaction: discord.Interaction):
+        ''' Command to list B4A sources with detailed MCP tool lists and RSS feed names. '''
+        logger.info(f'Command \'/context_details\' invoked by {interaction.user}')
+        await interaction.response.defer(thinking=True, ephemeral=False)
+
+        message_parts = ['**B4A Context Details:**\n']
+
+        # MCP Sources
+        message_parts.append(f'\n**MCP Sources (@mcp): {len(self.b4a_data.mcp_sources)} configured**')
+        if not self.b4a_data.mcp_sources:
+            message_parts.append('  *None configured or loaded.*')
+        else:
+            for mcp_conf in self.b4a_data.mcp_sources:
+                name = mcp_conf.name
+                status_icon = '❓'; status_text = 'Unknown'
+                tools_available = False
+                if name in self.mcp_connections and name in self.mcp_tools:
+                    status_icon = '🟢'; status_text = f'Connected ({len(self.mcp_tools[name])} tools listed)'
+                    tools_available = bool(self.mcp_tools[name])
+                elif name in self.mcp_connections:
+                    status_icon = '🟡'; status_text = 'Connected (Tool list issue?)'
+                elif name in self._connection_tasks and not self._connection_tasks[name].done():
+                    status_icon = '🟠'; status_text = 'Connecting…'
+                else:
+                    status_icon = '🔴'; status_text = 'Disconnected / Failed'
+
+                message_parts.append(f'\n- **{name}**: {status_icon} {status_text} ({mcp_conf.url})')
+                if tools_available:
+                    message_parts.append('  *Available Tools:*')
+                    for tool in self.mcp_tools[name]:
+                        desc = (tool.description or 'No description').split('\n')[0] # First line of desc
+                        desc_short = (desc[:70] + '...') if len(desc) > 70 else desc
+                        message_parts.append(f'    - `{tool.name}`: {desc_short}')
+                elif status_icon == '🟢' and not tools_available:
+                     message_parts.append('  *No tools listed by this source.*')
+
+        # RSS Sources
+        message_parts.append(f'\n\n**RSS Sources (@rss): {len(self.b4a_data.rss_sources)} configured**')
+        if not self.b4a_data.rss_sources:
+            message_parts.append('  *None configured or loaded.*')
+        else:
+            rss_tool_status = 'Active (`query_rss_feed` tool available)' if FEEDPARSER_AVAILABLE else 'Inactive (`feedparser` missing)'
+            message_parts.append(f'  *Status:* {rss_tool_status}')
+            feed_names = [conf.name for conf in self.b4a_data.rss_sources]
+            message_parts.append(f'  *Configured Feeds:* {', '.join(f'`{name}`' for name in feed_names)}')
+
+        # Chat history storage (same logic from /context_info)
+        message_parts.append('\n\n**Chat History Storage:**')
+        if self.pgvector_config.get('enabled', False):
+            if self.pgvector_enabled: message_parts.append('- 🟢 PGVector: **Enabled and Active**')
+            else: message_parts.append('- 🔴 PGVector: **Configured but FAILED to initialize** (Check logs)')
+        else: message_parts.append('- ⚪ In-Memory: **Enabled** (PGVector not configured or disabled)')
+
+        # Unhandled sources & loading errors display can be copied from /context_info
+
+        final_message = '\n'.join(message_parts)
+        await send_long_message(interaction, final_message.strip() or 'No B4A sources found or configured.', followup=True)
 
     # Chat Commands (Prefix and Slash)
 
@@ -1129,20 +1322,20 @@ class MCPCog(commands.Cog):
             await ctx.send('You don\'t need a prefix in DMs! Just send your message directly.')
             return
 
-        logger.info(f'Prefix command "!chat" invoked by {ctx.author} ({ctx.author.id}) in channel {ctx.channel.id}')
+        logger.info(f'Prefix command `!chat` invoked by {ctx.author} ({ctx.author.id}) in channel {ctx.channel.id}')
         channel_id = ctx.channel.id
         user_id = ctx.author.id
 
         # Check if message is empty OR if there are only attachments and no message text
         # Not allowing attachment-only messages in this case, but let's check that
         if not message.strip() and not ctx.message.attachments:
-            await ctx.send("⚠️ Please provide a message or attach a file to chat about!")
+            await ctx.send('⚠️ Please provide a message or attach a file to chat about!')
             return
 
         # Get attachments
         attachments = ctx.message.attachments
         if attachments:
-            logger.info(f'Prefix command !chat received {len(attachments)} attachments.')
+            logger.info(f'Prefix command `!chat` received {len(attachments)} attachments.')
 
         async with ctx.typing():
             await self._handle_chat_logic(
@@ -1177,7 +1370,7 @@ class MCPCog(commands.Cog):
         # Slash commands can technically be invoked in DMs if enabled globally or for DMs.
         # Let's keep it consistent and allow it, as _handle_chat_logic works fine.
         # if interaction.guild is None:
-        #     await interaction.response.send_message("You can just send messages directly in DMs!", ephemeral=True)
+        #     await interaction.response.send_message('You can just send messages directly in DMs!', ephemeral=True)
         #     return
 
         logger.info(f'Slash command `/chat` invoked by {interaction.user} ({interaction.user.id}) in channel {interaction.channel_id}')
@@ -1186,7 +1379,7 @@ class MCPCog(commands.Cog):
 
         # Check for empty message/attachment
         if not message.strip() and not attachment:
-            await interaction.response.send_message("⚠️ Please provide a message or attach a file to chat about!", ephemeral=True)
+            await interaction.response.send_message('⚠️ Please provide a message or attach a file to chat about!', ephemeral=True)
             return
 
         # Prepare attachments list (even if only one)
@@ -1220,7 +1413,7 @@ class MCPCog(commands.Cog):
             error_message = f'⏳ Woah there! This command is on cooldown. Try again in {error.retry_after:.1f} seconds.'
         elif isinstance(error, app_commands.CheckFailure):
             error_message = 'You don\'t have the necessary permissions or conditions met to use this command.'
-            logger.warning(f"CheckFailure for /chat by {interaction.user}: {error}")
+            logger.warning(f'CheckFailure for /chat by {interaction.user}: {error}')
         # elif isinstance(error, app_commands.NoPrivateMessage): # If we added a guild_only check
         #      error_message = 'This command cannot be used in Direct Messages.'
         else:
