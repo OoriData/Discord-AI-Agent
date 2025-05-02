@@ -55,6 +55,9 @@ DISCORD_CHANNEL_HISTORY_NAMESPACE = uuid.UUID('faa9e9c4-1f01-4e27-933d-6460b8924
 ALLOWED_FOR_LLM_INIT = ['base_url', 'api_key'] # Adjusted for openai > 1.0
 ALLOWED_FOR_LLM_CHAT = ['model', 'temperature', 'max_tokens', 'top_p'] # Added common chat params
 
+# FIXME: Use Word Loom
+DEFAULT_SYSTEM_MESSAGE = 'You are a helpful AI assistant. When you need to use a tool, you MUST use the provided function-calling mechanism. Do NOT simply describe the tool call in your text response.'
+
 # API Key Handling - ensure OPENAI_API_KEY is checked/set if needed by the AsyncOpenAI client
 # The logic in __init__ already handles this using the config/env var.
 
@@ -183,7 +186,7 @@ class MCPCog(commands.Cog):
         logger.info('LLM chat parameters configured', **self.llm_chat_params)
 
         # Configure System Message
-        sysmsg = resolve_value(llm_endpoint_config.get('sysmsg', 'You are a helpful AI assistant.'))
+        sysmsg = resolve_value(llm_endpoint_config.get('sysmsg', DEFAULT_SYSTEM_MESSAGE))
         sys_postscript = resolve_value(llm_endpoint_config.get('sys_postscript', ''))
         self.system_message = sysmsg + ('\n\n' + sys_postscript if sys_postscript else '')
         logger.info('System message configured.', sysmsg_len=len(sysmsg), postscript_len=len(sys_postscript))
@@ -401,7 +404,7 @@ class MCPCog(commands.Cog):
                 # Check if system message needs to be prepended manually or if it's stored
                 # Assuming it IS stored as the first message during insertion.
                 # If not, prepend: formatted_history = [{'role': 'system', 'content': self.system_message}]
-                import pprint; pprint.pprint(pg_messages)
+                # import pprint; pprint.pprint(pg_messages)
                 for msg in pg_messages:
                     formatted_history.append({'role': msg['role'], 'content': msg['content']})
 
@@ -929,6 +932,10 @@ class MCPCog(commands.Cog):
                         tool_calls_aggregated = [{'id': tc.id, 'type': tc.type, 'function': {'name': tc.function.name, 'arguments': tc.function.arguments}}
                                                 for tc in raw_tool_calls if tc.type == 'function' and tc.function and tc.id and tc.function.name]
                         logger.debug(f'Non-streaming response included {len(tool_calls_aggregated)} raw tool calls.', channel_id=channel_id)
+                    elif '<tool_call>' in initial_response_content:
+                        # Fallback for legacy tool call format
+                        logger.warning('LLM generated tool call as text, attempting to parse.')
+                        tool_calls_aggregated, initial_response_content = extract_tool_calls_from_content(initial_response_content)
 
             except OpenAIError as api_exc: # Catch specific OpenAI errors
                 logger.exception('Error during LLM API call', channel_id=channel_id, user_id=user_id, error_type=type(api_exc).__name__)
@@ -1432,3 +1439,44 @@ class MCPCog(commands.Cog):
             logger.error(f'Failed to send slash command error message for interaction {interaction.id}: {e}')
         except Exception as e:
             logger.error(f'Generic exception sending slash command error for interaction {interaction.id}: {e}')
+
+def extract_tool_calls_from_content(content: str, assistant_message_dict: dict) -> list[dict]:
+    ''' Extracts tool calls from the content string. '''
+    import re
+    import json # Ensure json is imported
+
+    parsed_tool_calls = []
+    # Basic regex to find the JSON within the tags (adjust if needed)
+    matches = re.finditer(r'<tool_call>(.*?)</tool_call>', content, re.DOTALL)
+    for match in matches:
+        try:
+            tool_json_str = match.group(1).strip()
+            tool_data = json.loads(tool_json_str)
+            # Need to invent a tool_call_id if not provided by LLM text
+            tool_call_id = f'parsed_{uuid.uuid4()}'
+            if 'name' in tool_data and 'arguments' in tool_data:
+                 parsed_tool_calls.append({
+                     'id': tool_call_id,
+                     'type': 'function', # Assume function
+                     'function': {
+                         'name': tool_data['name'],
+                         # Ensure arguments are stringified if needed by later code
+                         'arguments': json.dumps(tool_data['arguments']) if isinstance(tool_data['arguments'], dict) else str(tool_data['arguments'])
+                     }
+                 })
+                 logger.info(f'Parsed text tool call: {tool_data['name']}')
+            else:
+                 logger.warning('Parsed tool call text missing name or arguments.', parsed_text=tool_json_str)
+        except json.JSONDecodeError:
+            logger.error('Failed to decode JSON from text tool call.', matched_text=match.group(1))
+        except Exception as parse_err:
+            logger.exception('Error parsing text tool call.', error=parse_err)
+
+    if parsed_tool_calls:
+        # Overwrite tool_calls_aggregated with the parsed ones
+        tool_calls_aggregated = parsed_tool_calls
+        # Optionally remove the <tool_call> text from initial_response_content
+        updated_content = re.sub(r'<tool_call>.*?</tool_call>', '', content, flags=re.DOTALL).strip()
+        assistant_message_dict['content'] = content # Update content if modified
+        logger.info(f'Proceeding with {len(tool_calls_aggregated)} tool calls parsed from text.')
+    return tool_calls_aggregated, updated_content
