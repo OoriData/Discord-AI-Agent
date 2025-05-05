@@ -4,6 +4,12 @@ Discord bot for supporting AI/LLM chat applications powered by the Model Context
 
 For general MCP resources, see Arkestra:cookbook/mcp/README.md
 
+# Install
+
+```sh
+uv pip install -U .
+```
+
 # Configuration
 
 ```sh
@@ -20,9 +26,10 @@ cp config/toys.example.b4a.toml config/toys.b4a.toml
 
 # Running
 
-If you included `toys.b4a.toml` in your `main.toml` you'll need to have that MCP server running. In a separate terminal `cd demo_server` then run
+If you included `toys.b4a.toml` in your `main.toml` you'll need to have that MCP server running. In a separate terminal:
 
 ```sh
+cd demo_server 
 uv pip install -Ur requirements.txt --constraint=constraints.txt
 uvicorn toy_mcp_server:create_app --factory --host 127.0.0.1 --port 8902
 ```
@@ -50,11 +57,15 @@ python mcp_discord_bot.py # Reads from env vars
 
 # Sample queries
 
-# From the toy MCP servers
+## From the toy MCP servers
 
 * Ask the magic 8-ball if I should deploy to production on Friday
 * Consult the magic 8-ball about my chances of winning the lottery
 * Magic 8-ball, tell me: will it rain tomorrow?
+
+## From RSS (Based on r/LocalLlama)
+
+* Any recent observations about Qwen 3 among Local LLM enthusiasts today?
 
 ## PGVector chat history
 
@@ -184,3 +195,9 @@ You can just use `util/supabase_setup.py`, which you should run only once.
 ```sh
 op run --env-file .env -- python util/supabase_setup.py
 ```
+
+Note: [Supavisor does not support prepared statements in transaction mode. It does via direct connections & in session mode.](https://supabase.com/docs/guides/troubleshooting/disabling-prepared-statements-qL8lEL)
+
+To make sure asyncpg doesn't cause probs with this
+
+> Disable automatic use of prepared statements by passing `statement_cache_size=0` to `asyncpg.connect()` and `asyncpg.create_pool()` (and, obviously, avoid the use of `Connection.prepare()`

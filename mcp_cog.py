@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-present Oori Data <info@oori.dev>
+# SPDX-License-Identifier: Apache-2.0
 # mcp_cog.py
 '''
 Discord cog for MCP integration using mcp-sse-client. Connects to MCP servers
@@ -6,25 +8,22 @@ and provides commands to interact with MCP tools via an LLM.
 import os
 import json
 import asyncio
-from typing import Any, Union, Optional
+from typing import Any
 import uuid
-import time
+# import time
 # import traceback
 
 import discord
 from discord import app_commands, abc as discord_abc
 from discord.ext import commands
-from discord import app_commands
+
 import structlog
-from openai import AsyncOpenAI, OpenAIError
 # Openai types might be useful for clarity
-from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageToolCall
-from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceDelta
 from ogbujipt.embedding.pgvector import MessageDB
 
-from mcp_sse_client import MCPClient, ToolDef, ToolInvocationResult, ToolParameter # Added
+from mcp_sse_client import MCPClient, ToolDef, ToolInvocationResult, ToolParameter
 from b4a_config import B4ALoader, MCPConfig, resolve_value
-from source_handlers import fetch_and_parse_rss, FEEDPARSER_AVAILABLE # Import the function and flag
+from source_handlers import FEEDPARSER_AVAILABLE
 
 # XXX: Clean up exception handling & imports by better study of mcp-sse-client
 # Needed for ClosedResourceError/BrokenResourceError handling if not imported via sse/mcp
@@ -45,6 +44,10 @@ except ImportError:
     class ConnectError(IOError): pass
     class ReadTimeout(TimeoutError): pass
 
+from discord_aiagent.rssutil import RSSAgent
+from discord_aiagent.discordutil import send_long_message, handle_attachments
+from discord_aiagent.openaiutil import OpenAILLMWrapper, MissingLLMResponseError, LLMResponseError, ToolCallExecutionError
+
 
 logger = structlog.get_logger(__name__)
 
@@ -63,92 +66,21 @@ DEFAULT_SYSTEM_MESSAGE = 'You are a helpful AI assistant. When you need to use a
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false' # Disable parallelism for tokenizers to avoid warnings
 
-# Helper Function for Message Splitting
-async def send_long_message(sendable: Union[commands.Context, discord.Interaction, discord_abc.Messageable], content: str, followup: bool = False, ephemeral: bool = False):
-    '''
-    Sends a message, splitting it into multiple parts if it exceeds Discord's limit.
-    Handles both Context and Interaction objects.
-    '''
-    max_length = 2000
-    start = 0
-    # Ensure content is a string, even if it's None or another type unexpectedly
-    content_str = str(content) if content is not None else ''
-    if not content_str.strip(): # Don't try to send empty messages
-        logger.debug('Attempted to send empty message.')
-        return
 
-    first_chunk = True
-    while start < len(content_str):
-        end = start + max_length
-        chunk = content_str[start:end]
-        try:
-            if isinstance(sendable, commands.Context):
-                await sendable.send(chunk)
-            elif isinstance(sendable, discord.Interaction):
-                use_followup = followup or start > 0 or sendable.response.is_done()
-                can_be_ephemeral = (use_followup and first_chunk) or (not use_followup and len(content_str) <= max_length)
-                send_ephemeral = ephemeral and can_be_ephemeral
-
-                if use_followup:
-                    if not sendable.response.is_done():
-                        # Interaction likely wasn't deferred or followup wasn't requested initially.
-                        # Use original response if possible, otherwise log warning.
-                        # This path is less common if defer() is used consistently.
-                        try:
-                            await sendable.response.send_message(chunk, ephemeral=send_ephemeral)
-                            logger.debug('Sent initial interaction response (unexpected path after deferral).')
-                        except discord.InteractionResponded:
-                            logger.warning('Interaction already responded, but followup wasn\'t triggered correctly. Sending via followup.')
-                            await sendable.followup.send(chunk, ephemeral=send_ephemeral) # Fallback to followup
-                    else:
-                        await sendable.followup.send(chunk, ephemeral=send_ephemeral)
-                else:
-                     # Initial response for non-deferred interaction or first message.
-                     await sendable.response.send_message(chunk, ephemeral=send_ephemeral)
-            elif isinstance(sendable, discord_abc.Messageable):
-                # DMs don't support ephemeral or followups in the same way as interactions
-                # Just send directly to the channel
-                await sendable.send(chunk)
-                # Reset ephemeral flag for logging clarity if it was passed for a DM
-                ephemeral = False
-
-        except discord.HTTPException as e:
-            logger.error(f'Failed to send message chunk: {e}', chunk_start=start, sendable_type=type(sendable), ephemeral=ephemeral, status=e.status, code=e.code)
-            # Try to inform user ephemerally if possible
-            error_msg = f'Error sending part of the message (Code: {e.code}). Please check channel permissions or message content.'
-            try:
-                if isinstance(sendable, discord.Interaction):
-                    # Use followup if possible, it's more reliable after potential initial errors
-                    if sendable.response.is_done():
-                        await sendable.followup.send(error_msg, ephemeral=True)
-                    else:
-                        # Avoid double-responding if initial send failed
-                        pass # await sendable.response.send_message(error_msg, ephemeral=True) # Risky if initial failed
-                # else: await sendable.send(error_msg) # Avoid sending public errors if interaction failed
-            except Exception:
-                pass # Avoid error loops
-            break # Stop sending further chunks on error
-
-        start = end
-        first_chunk = False
-        if start < len(content_str): # Only sleep if more chunks are coming
-            await asyncio.sleep(0.2)
-
-
-class MCPCog(commands.Cog):
+class MCPCog(commands.Cog, RSSAgent):
     def __init__(self, bot: commands.Bot, config: dict[str, Any], b4a_data: B4ALoader, pgvector_config: dict[str, Any]):
+        RSSAgent.__init__(self, b4a_data, {}, 0) # Initialize RSSAgent with empty cache
         self.bot = bot
-        self.config = config # Agent config (LLM, etc.)
-        self.b4a_data = b4a_data     # Loaded B4A source data
-        self.mcp_connections: dict[str, MCPClient] = {} # Keyed by MCPConfig.name
-        self.mcp_tools: dict[str, list[ToolDef]] = {} # Keyed by MCPConfig.name
+        self.config = config  # Agent config (LLM, etc.)
+        self.mcp_connections: dict[str, MCPClient] = {}  # Keyed by MCPConfig.name
+        self.mcp_tools: dict[str, list[ToolDef]] = {}  # Keyed by MCPConfig.name
         self.message_history: dict[int, list[dict[str, Any]]] = {}
 
         self._connection_tasks: dict[str, asyncio.Task] = {}
         self._shutdown_event = asyncio.Event()
 
         self.pgvector_config = pgvector_config
-        self.pgvector_db: Optional[MessageDB] = None
+        self.pgvector_db: MessageDB | None = None
         self.pgvector_enabled = self.pgvector_config.get('enabled', False)
 
         self._rss_feed_cache: dict[str, tuple[float, Any]] = {}
@@ -165,25 +97,18 @@ class MCPCog(commands.Cog):
         if not llm_init_params.get('base_url'):
             raise ValueError('LLM \'base_url\' is required.')
 
-        try:
-            self.llm_client = AsyncOpenAI(**llm_init_params)
-            logger.info('AsyncOpenAI client initialized.', **llm_init_params)
-        except Exception as e:
-            logger.exception('Failed to initialize OpenAI client', config=llm_init_params)
-            raise e
-
         # Configure LLM Chat Parameters (Combine defaults, model_params, llm_endpoint)
-        self.llm_chat_params = {
+        llm_chat_params = {
              'model': llm_endpoint_config.get('label', 'local-model'), # Default model name
              'temperature': 0.3, 'max_tokens': 1000, # Base defaults
         }
         # Apply overrides from [model_params] first
         model_param_overrides = {k: resolve_value(v) for k, v in model_params_config.items() if k in ALLOWED_FOR_LLM_CHAT}
-        self.llm_chat_params.update(model_param_overrides)
+        llm_chat_params.update(model_param_overrides)
         # Apply any *other* allowed chat params found in [llm_endpoint]
         endpoint_chat_overrides = {k: resolve_value(v) for k, v in llm_endpoint_config.items() if k in ALLOWED_FOR_LLM_CHAT and k not in model_param_overrides}
-        self.llm_chat_params.update(endpoint_chat_overrides)
-        logger.info('LLM chat parameters configured', **self.llm_chat_params)
+        llm_chat_params.update(endpoint_chat_overrides)
+        logger.info('LLM chat parameters configured', **llm_chat_params)
 
         # Configure System Message
         sysmsg = resolve_value(llm_endpoint_config.get('sysmsg', DEFAULT_SYSTEM_MESSAGE))
@@ -191,6 +116,13 @@ class MCPCog(commands.Cog):
         self.system_message = sysmsg + ('\n\n' + sys_postscript if sys_postscript else '')
         logger.info('System message configured.', sysmsg_len=len(sysmsg), postscript_len=len(sys_postscript))
         logger.debug(f'Full system message: {self.system_message}') # Debug level for full message
+
+        try:
+            self.llm_client = OpenAILLMWrapper(llm_init_params, llm_chat_params, self)
+            logger.info('AsyncOpenAI client initialized.', **llm_init_params)
+        except Exception as e:
+            logger.exception('Failed to initialize OpenAI client', config=llm_init_params)
+            raise e
 
         # Log B4A Loading Summary
         if self.b4a_data.load_errors:
@@ -210,7 +142,7 @@ class MCPCog(commands.Cog):
 
         while not self._shutdown_event.is_set():
             logger.info(f'Attempting connection for MCP source: \'{name}\'', url=url)
-            client: Optional[MCPClient] = None
+            client: MCPClient | None = None
             try:
                 # TODO: Add auth handling here based on mcp_config fields if needed
                 client = MCPClient(url)
@@ -435,69 +367,7 @@ class MCPCog(commands.Cog):
 
         return self.message_history[channel_id]
 
-    async def _execute_rss_query(self, tool_input: dict[str, Any]) -> dict[str, str]:
-        '''Handles the execution of the 'query_rss_feed' tool.'''
-        feed_name = tool_input.get('feed_name')
-        query = tool_input.get('query') # Optional query string
-        limit = tool_input.get('limit', 5) # Default limit
-
-        if not feed_name:
-            return {'error': 'Missing required parameter: feed_name'}
-        if not isinstance(limit, int) or limit < 1:
-            limit = 5 # Default to 5 if invalid limit provided
-
-        # Find the RSSConfig
-        rss_conf = next((conf for conf in self.b4a_data.rss_sources if conf.name == feed_name), None)
-        if not rss_conf:
-            return {'error': f'Configured RSS feed named `{feed_name}` not found.'}
-
-        # Fetch and parse using the handler function
-        parsed_feed, error = await fetch_and_parse_rss(rss_conf.url, self._rss_feed_cache, self._rss_cache_ttl)
-
-        if error:
-            return {'error': f'Error fetching feed `{feed_name}`: {error}'}
-        if not parsed_feed or not hasattr(parsed_feed, 'entries'):
-             return {'error': f'Failed to get valid entries from feed `{feed_name}`.'}
-
-        # Filter entries if query is provided
-        matching_entries = []
-        if query:
-            query_lower = query.lower()
-            for entry in parsed_feed.entries:
-                title = entry.get('title', '').lower()
-                summary = entry.get('summary', '').lower()
-                # Basic keyword check in title or summary
-                if query_lower in title or query_lower in summary:
-                    matching_entries.append(entry)
-        else:
-            # No query, use all entries (up to the limit)
-            matching_entries = parsed_feed.entries
-
-        # Limit the results
-        limited_entries = matching_entries[:limit]
-
-        if not limited_entries:
-            result_text = f'No entries found in feed `{feed_name}`'
-            if query: result_text += f' matching query `{query}`'
-            return {'result': result_text}
-
-        # Format the results
-        result_items = []
-        for entry in limited_entries:
-            title = entry.get('title', 'No Title')
-            link = entry.get('link', 'No Link')
-            summary = entry.get('summary', 'No Summary')
-            # Simple formatting, truncate summary
-            summary_short = (summary[:200] + '...') if len(summary) > 200 else summary
-            result_items.append(f'- Title: {title}\n  Link: {link}\n  Summary: {summary_short}')
-
-        final_result = f'Found {len(limited_entries)} entries from feed `{feed_name}`'
-        if query: final_result += f' matching query `{query}`'
-        final_result += ':\n\n' + '\n\n'.join(result_items)
-
-        return {'result': final_result}
-
-    async def execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> Union[ToolInvocationResult, dict[str, str]]:
+    async def execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> ToolInvocationResult | dict[str, str]:
         '''
         Execute an MCP tool or the RSS query tool.
         Returns ToolInvocationResult for MCP tools, or a dict for RSS/errors.
@@ -507,10 +377,10 @@ class MCPCog(commands.Cog):
         if tool_name == 'query_rss_feed':
             if not FEEDPARSER_AVAILABLE:
                 return {'error': 'RSS querying is disabled because the `feedparser` library is not installed.'}
-            return await self._execute_rss_query(tool_input)
+            return await self.execute_rss_query(tool_input)
 
-        mcp_client: Optional[MCPClient] = None
-        server_name_found: Optional[str] = None  # B4A source name
+        mcp_client: MCPClient | None = None
+        server_name_found: str | None = None  # B4A source name
 
         # Find the server/client (keyed by B4A source name) that has the tool
         for source_name, client in self.mcp_connections.items():
@@ -572,57 +442,6 @@ class MCPCog(commands.Cog):
         except Exception as e:
             logger.exception(f'Unexpected error calling tool `{tool_name}` on server `{server_name_found}`', tool_input=tool_input)
             return {'error': f'Error calling tool `{tool_name}`: {str(e)}'}
-
-    def format_calltoolresult_content(self, result: Union[ToolInvocationResult, dict[str, str]]) -> str:
-        '''
-        Extract content from a ToolInvocationResult object or format error dict.
-        Handles common MCP content structures like text content.
-        '''
-        if isinstance(result, ToolInvocationResult):
-            # ToolInvocationResult has .content and .error_code
-            # We assume execute_tool already converted errors to the dict format.
-            # So, if we receive ToolInvocationResult here, it should be a success.
-            content = result.content
-            if content is None:
-                 # Assume tool_name attribute exists on ToolInvocationResult based on library structure
-                 tool_name_attr = getattr(result, 'tool_name', 'unknown_tool')
-                 logger.warning('MCP ToolInvocationResult received with None content.', tool_name=tool_name_attr, error_code=result.error_code) # Assuming tool_name exists
-                 return 'Tool executed successfully but returned no content.'
-
-            if isinstance(content, dict) and content.get('type') == 'text' and 'text' in content:
-                 text_content = content['text']
-                 # Return the text directly, converting simple types to string
-                 return str(text_content) if text_content is not None else ''
-
-            # Handle other types (simple types, lists, other dicts)
-            elif isinstance(content, (str, int, float, bool)):
-                return str(content)
-            elif isinstance(content, (dict, list)):
-                try:
-                    # Nicely format other JSON-like structures
-                    return json.dumps(content, indent=2)
-                except TypeError as json_err:
-                    logger.warning('Could not JSON serialize MCP tool result content.', content_type=type(content), error=str(json_err))
-                    return str(content) # Fallback
-            else:
-                logger.warning('Unexpected type for MCP ToolInvocationResult content.', content_type=type(content))
-                return str(content)
-
-        elif isinstance(result, dict):
-            # Handle RSS result or any error dict
-            if 'result' in result:
-                return str(result['result']) # Return the formatted RSS result string
-            elif 'error' in result:
-                return f'Tool Error: {result['error']}' # Return formatted error
-            else:
-                # Gracefully handle unexpected dict format
-                logger.warning('Unexpected dict format received in format_calltoolresult_content', received_result=result)
-                try: return json.dumps(result, indent=2)
-                except TypeError: return f'Unexpected tool result format: {str(result)[:200]}'
-        else:
-            # Gracefully handle unexpected types
-            logger.warning('Unexpected format received in format_calltoolresult_content', received_result=result)
-            return f'Unexpected tool result format: {str(result)[:200]}'
 
     def _map_mcp_type_to_json_type(self, mcp_type: str) -> str:
         '''Maps MCP parameter types to JSON Schema types.'''
@@ -763,12 +582,12 @@ class MCPCog(commands.Cog):
 
     async def _handle_chat_logic(
         self,
-        sendable: Union[commands.Context, discord.Interaction, discord_abc.Messageable],
+        sendable: commands.Context | discord.Interaction | discord_abc.Messageable,
         message: str,
         channel_id: int,
         user_id: int,
         stream: bool,
-        attachments: Optional[list[discord.Attachment]] = None
+        attachments: list[discord.Attachment] | None = None
     ):
         '''
         Core logic for handling chat interactions, LLM calls, and tool execution.
@@ -784,67 +603,9 @@ class MCPCog(commands.Cog):
 
         history_key = uuid.uuid5(DISCORD_CHANNEL_HISTORY_NAMESPACE, str(channel_id)) # Generate UUID key once
 
-        # Attachment Handling
         if attachments:
             logger.info(f'Processing {len(attachments)} attachments for channel {channel_id}', user_id=user_id)
-            attachment_texts = []
-            for attachment in attachments:
-                try:
-                    # Basic info
-                    attachment_info = f'\n\n--- Attachment: {attachment.filename} ({attachment.content_type}, {attachment.size} bytes) ---\n'
-
-                    # Placeholder for file type registration and preprocessing
-                    # Example:
-                    # registered_handler = file_handlers.get(attachment.content_type)
-                    # if registered_handler:
-                    #     content = await registered_handler(attachment)
-                    # elif attachment.content_type.startswith('image/'):
-                    #     # Placeholder for image-to-text model
-                    #     content = f'[Content of image {attachment.filename} - requires image model]'
-                    # elif attachment.filename.endswith('.xlsx'):
-                    #     # Placeholder for Excel to CSV/text conversion
-                    #     content = f'[Content of Excel file {attachment.filename} - requires processing]'
-                    # elif attachment.content_type.startswith('text/'):
-                    #     # Default: Read text-based files directly
-                    #     content_bytes = await attachment.read()
-                    #     # Attempt decoding, fall back to representing as bytes if fails
-                    #     try:
-                    #         content = content_bytes.decode('utf-8') # Or try other common encodings
-                    #     except UnicodeDecodeError:
-                    #         logger.warning(f'Could not decode attachment {attachment.filename} as UTF-8.', attachment_id=attachment.id)
-                    #         content = f'[Binary content of {attachment.filename}]'
-                    # else:
-                    #     # Default for unknown types
-                    #     content = f'[Unsupported attachment type: {attachment.content_type}]'
-
-                    # Default behavior: Read text files, provide placeholder for others
-                    if attachment.content_type and attachment.content_type.startswith('text/'):
-                        try:
-                            content_bytes = await attachment.read()
-                            content = content_bytes.decode('utf-8')
-                            # Optional: Truncate large files
-                            max_len = 5000 # Example limit
-                            if len(content) > max_len:
-                                content = content[:max_len] + '\n[... content truncated ...]'
-                        except UnicodeDecodeError:
-                            logger.warning(f'Could not decode text attachment {attachment.filename} as UTF-8.', attachment_id=attachment.id)
-                            content = f'[Could not decode content of {attachment.filename}]'
-                        except discord.HTTPException as e:
-                            logger.error(f'Failed to read attachment {attachment.filename}: {e}', attachment_id=attachment.id)
-                            content = f'[Error reading attachment {attachment.filename}]'
-                    else:
-                        # Placeholder for non-text files (images, pdf, excel etc.)
-                        content = f'[Content of non-text file: {attachment.filename} ({attachment.content_type}) - requires specific processing]'
-
-                    attachment_texts.append(attachment_info + content)
-
-                except Exception as e:
-                    logger.exception(f'Error processing attachment {attachment.filename}', attachment_id=attachment.id)
-                    attachment_texts.append(f'\n\n[Error processing attachment: {attachment.filename}]')
-
-            # Prepend attachment contents to the user's message
-            processed_message = ''.join(attachment_texts) + '\n\n--- User Message ---\n' + message
-            logger.debug(f'Added content from {len(attachments)} attachments to the message.')
+            processed_message = await handle_attachments(attachments, message)
 
         try:
             # Get and update history
@@ -881,65 +642,21 @@ class MCPCog(commands.Cog):
                 except Exception as e:
                     logger.exception(f'Failed to store user message to PGVector for key {history_key}.')
 
-            # Prepare chat parameters (Combine endpoint & explicit settings)
-            chat_params = {**self.llm_chat_params, 'stream': stream} # Pass stream explicitly
             openai_tools = await self.format_tools_for_openai() # Gets both MCP and RSS tools
             if openai_tools:
-                chat_params['tools'] = openai_tools
-                chat_params['tool_choice'] = 'auto'
+                extra_chat_params = {
+                    'tools': openai_tools,
+                    'tool_choice': 'auto'
+                }
                 logger.debug(f'Including {len(openai_tools)} tools in LLM call for channel {channel_id}')
             else:
-                 logger.debug(f'No active tools available for LLM call for channel {channel_id}')
+                extra_chat_params = {}
+                logger.debug(f'No active tools available for LLM call for channel {channel_id}')
 
-            # LLM call & response handling, including tool calls
-            initial_response_content = ''
-            tool_calls_aggregated: list[dict[str, Any]] = []
-            assistant_message_dict: dict[str, Any] = {'role': 'assistant', 'content': None}
-
-            logger.debug(f'Initiating LLM call for channel {channel_id}', user_id=user_id, stream=stream, model=chat_params.get('model'))
             try:
-                if stream:
-                    llm_stream = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **chat_params)
-                    # llm_stream = await self.llm_client.chat.completions.create(messages=channel_history, **chat_params)
-                    current_tool_calls: list[dict[str, Any]] = []
-                    async for chunk in llm_stream:
-                        delta: Optional[ChoiceDelta] = chunk.choices[0].delta if chunk.choices else None
-                        if not delta: continue
-                        if token := delta.content or '': initial_response_content += token
-                        if delta.tool_calls:
-                            for tool_call_chunk in delta.tool_calls:
-                                idx = tool_call_chunk.index
-                                while len(current_tool_calls) <= idx:
-                                    current_tool_calls.append({'id': None, 'type': 'function', 'function': {'name': '', 'arguments': ''}})
-                                tc_ref = current_tool_calls[idx]
-                                chunk_func: Optional[ChoiceDeltaToolCall.Function] = tool_call_chunk.function
-                                if tool_call_chunk.id: tc_ref['id'] = tool_call_chunk.id
-                                if chunk_func:
-                                    if chunk_func.name: tc_ref['function']['name'] += chunk_func.name
-                                    if chunk_func.arguments: tc_ref['function']['arguments'] += chunk_func.arguments
-                    tool_calls_aggregated = [tc for tc in current_tool_calls if tc.get('id') and tc['function'].get('name')]
-                else: # Non-Streaming
-                    response = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **chat_params)
-                    # response = await self.llm_client.chat.completions.create(messages=channel_history, **chat_params)
-                    response_message: Optional[ChatCompletionMessage] = response.choices[0].message if response.choices else None
-                    if not response_message:
-                        logger.error('LLM response missing message object', response_data=response.model_dump_json(indent=2))
-                        await send_long_message(sendable, '⚠️ Received an empty response from AI.', followup=send_followup, ephemeral=can_be_ephemeral)
-                        return
-                    initial_response_content = response_message.content or ''
-                    raw_tool_calls: Optional[list[ChatCompletionMessageToolCall]] = response_message.tool_calls
-                    if raw_tool_calls:
-                        tool_calls_aggregated = [{'id': tc.id, 'type': tc.type, 'function': {'name': tc.function.name, 'arguments': tc.function.arguments}}
-                                                for tc in raw_tool_calls if tc.type == 'function' and tc.function and tc.id and tc.function.name]
-                        logger.debug(f'Non-streaming response included {len(tool_calls_aggregated)} raw tool calls.', channel_id=channel_id)
-                    elif '<tool_call>' in initial_response_content:
-                        # Fallback for legacy tool call format
-                        logger.warning('LLM generated tool call as text, attempting to parse.')
-                        tool_calls_aggregated, initial_response_content = extract_tool_calls_from_content(initial_response_content)
-
-            except OpenAIError as api_exc: # Catch specific OpenAI errors
-                logger.exception('Error during LLM API call', channel_id=channel_id, user_id=user_id, error_type=type(api_exc).__name__)
-                await send_long_message(sendable, f'⚠️ Error communicating with AI: {str(api_exc)}', followup=send_followup, ephemeral=can_be_ephemeral)
+                initial_response_content, tool_calls_aggregated = await self.llm_client(channel_history, str(user_id), extra_chat_params, stream=stream)
+            except MissingLLMResponseError | LLMResponseError as llm_err:
+                await send_long_message(sendable, llm_err.message, followup=send_followup, ephemeral=can_be_ephemeral)
                 return
             except Exception as e: # Catch other unexpected errors (e.g., network)
                 logger.exception('Unexpected error during LLM communication', channel_id=channel_id, user_id=user_id)
@@ -947,6 +664,7 @@ class MCPCog(commands.Cog):
                 return
 
             # Send Initial Response & Update History
+            assistant_message_dict: dict[str, Any] = {'role': 'assistant', 'content': None}
             sent_initial_message = False
             if initial_response_content.strip():
                 logger.debug(f'Sending initial LLM response to channel {channel_id}', length=len(initial_response_content), stream=stream)
@@ -991,117 +709,34 @@ class MCPCog(commands.Cog):
                 return
 
             # Process Tool Calls
+            async def tool_call_result_hook(tool_name, tool_call_id, tool_result_content_formatted, exc=None):
+                '''
+                Hook to handle tool call results and errors. Called for each tool call in the aggregated list.
+                '''
+                nonlocal send_followup
+                send_followup = True
+                if exc:
+                    await send_long_message(sendable, f'⚠️ Error during tool call `{tool_name}` execution: {str(exc)}', followup=send_followup, ephemeral=can_be_ephemeral)
+                else:
+                    await send_long_message(sendable, f'```Tool Call: {tool_name}\nResult:\n{tool_result_content_formatted}```', followup=True)
+
+                # PGVector Insertion: Tool Result
+                if self.pgvector_enabled and self.pgvector_db:
+                    try:
+                        logger.debug(f'Storing tool result ({tool_name}) to PGVector for key: {history_key}')
+                        metadata = {'user_id': 'tool_executor', 'discord_role': 'tool', 'tool_name': tool_name, 'tool_call_id': tool_call_id}
+                        await self.pgvector_db.insert(
+                            history_key=history_key,
+                            role='tool',
+                            content=tool_result_content_formatted, # Store formatted result
+                            metadata=metadata
+                        )
+                    except Exception as e:
+                        logger.exception(f'Failed to store tool result ({tool_name}) to PGVector for key {history_key}.')
+
             if tool_calls_aggregated:
-                tool_results_for_history = []
-
-                for tool_call in tool_calls_aggregated:
-                    # Basic validation of structure remains useful
-                    if not isinstance(tool_call, dict) or 'function' not in tool_call or 'id' not in tool_call:
-                        logger.error('Malformed tool call structure received from LLM', tool_call_data=tool_call)
-                        continue
-                    if not isinstance(tool_call['function'], dict) or 'name' not in tool_call['function'] or 'arguments' not in tool_call['function']:
-                        logger.error('Malformed tool call function structure received from LLM', tool_call_data=tool_call)
-                        continue
-
-                    tool_name = tool_call['function']['name']
-                    tool_call_id = tool_call['id']
-                    arguments_str = tool_call['function']['arguments']
-                    tool_result_content_for_llm = f'Error: Tool call processing failed internally before execution for {tool_name}' # Default
-
-                    try:
-                        # Ensure arguments are valid JSON
-                        try:
-                            tool_args = json.loads(arguments_str)
-                            if not isinstance(tool_args, dict):
-                                 raise TypeError('Arguments must be a JSON object (dict)')
-                        except (json.JSONDecodeError, TypeError) as json_err:
-                            logger.error(f'Failed to decode JSON args or not a dict for tool `{tool_name}`', args_str=arguments_str, tool_call_id=tool_call_id, error=str(json_err))
-                            tool_result_content_for_llm = f'Error: Invalid JSON object arguments provided for tool `{tool_name}`. LLM sent: {arguments_str}'
-                            await send_long_message(sendable, f'⚠️ Error: Couldn\'t understand arguments for tool `{tool_name}`. LLM provided malformed JSON: `{arguments_str}`', followup=True, ephemeral=can_be_ephemeral)
-                            send_followup = True
-                            # Append failure result to history
-                            tool_results_for_history.append({'role': 'tool', 'tool_call_id': tool_call_id, 'name': tool_name, 'content': tool_result_content_for_llm})
-                            continue # Skip execution for this tool call
-
-                        logger.info(f'Executing tool `{tool_name}` for channel {channel_id}', args=tool_args, tool_call_id=tool_call_id)
-                        tool_result_obj = await self.execute_tool(tool_name, tool_args) # Handles both MCP and RSS
-
-                        tool_result_content_formatted = self.format_calltoolresult_content(tool_result_obj)
-                        tool_result_content_for_llm = tool_result_content_formatted # Send formatted result back to LLM
-
-                        tool_result_dict = {
-                            'role': 'tool',
-                            'tool_call_id': tool_call_id,
-                            'name': tool_name,
-                            'content': tool_result_content_for_llm
-                        }
-                        tool_results_for_history.append(tool_result_dict)
-
-                        # PGVector Insertion: Tool Result
-                        if self.pgvector_enabled and self.pgvector_db:
-                            try:
-                                logger.debug(f'Storing tool result ({tool_name}) to PGVector for key: {history_key}')
-                                metadata = {'user_id': 'tool_executor', 'discord_role': 'tool', 'tool_name': tool_name, 'tool_call_id': tool_call_id}
-                                await self.pgvector_db.insert(
-                                    history_key=history_key,
-                                    role='tool',
-                                    content=tool_result_content_for_llm, # Store formatted result
-                                    metadata=metadata
-                                )
-                            except Exception as e:
-                                logger.exception(f'Failed to store tool result ({tool_name}) to PGVector for key {history_key}.')
-
-                        # Send result back to user (non-ephemeral)
-                        await send_long_message(sendable, f'```Tool Call: {tool_name}\nResult:\n{tool_result_content_formatted}```', followup=True)
-                        send_followup = True
-
-                    except Exception as exec_e:
-                        # Catch errors from execute_tool or format_calltoolresult_content itself (should be rare now)
-                        logger.exception(f'Unexpected error during tool execution/formatting phase for `{tool_name}`', tool_call_id=tool_call_id)
-                        tool_result_content_for_llm = f'Error during tool execution phase for `{tool_name}`: {str(exec_e)}'
-                        await send_long_message(sendable, f'⚠️ Unexpected Error running tool `{tool_name}`: {str(exec_e)}', followup=True, ephemeral=can_be_ephemeral)
-                        send_followup = True
-
-                    # Append result to history (even if it was an error during execution phase)
-                    tool_results_for_history.append({
-                        'role': 'tool',
-                        'tool_call_id': tool_call_id,
-                        'name': tool_name,
-                        'content': tool_result_content_for_llm
-                    })
-
-                # Follow-up LLM Call
-                if tool_results_for_history:
-                    channel_history.extend(tool_results_for_history)
-                    logger.debug(f'Added {len(tool_results_for_history)} tool results to history for channel {channel_id}')
-
-                    logger.debug(f'Initiating follow-up LLM call for channel {channel_id} after tools.', stream=stream)
-                    follow_up_params = {**self.llm_chat_params, 'stream': stream}
-                    follow_up_params.pop('tools', None) # No tools needed for follow-up
-                    follow_up_params.pop('tool_choice', None)
-
-                    follow_up_text = ''
-                    try:
-                        if stream:
-                            follow_up_stream = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **follow_up_params)
-                            # follow_up_stream = await self.llm_client.chat.completions.create(messages=channel_history, **follow_up_params)
-                            async for chunk in follow_up_stream:
-                                if token := chunk.choices[0].delta.content or '': follow_up_text += token
-                        else:
-                            follow_up_response = await self.llm_client.chat.completions.create(messages=channel_history, user=str(user_id), **follow_up_params)
-                            # follow_up_response = await self.llm_client.chat.completions.create(messages=channel_history, **follow_up_params)
-                            follow_up_message = follow_up_response.choices[0].message if follow_up_response.choices else None
-                            if follow_up_message: follow_up_text = follow_up_message.content or ''
-
-                    except OpenAIError as followup_exc: # Catch specific OpenAI errors
-                        logger.exception('Error during follow-up LLM call', channel_id=channel_id, user_id=user_id, error_type=type(followup_exc).__name__)
-                        await send_long_message(sendable, f'⚠️ Error getting follow-up response from AI: {str(followup_exc)}', followup=True, ephemeral=can_be_ephemeral)
-                        return
-                    except Exception as e: # Catch other unexpected errors
-                        logger.exception('Unexpected error during follow-up LLM communication', channel_id=channel_id, user_id=user_id)
-                        await send_long_message(sendable, f'⚠️ Unexpected error getting follow-up AI response: {str(e)}', followup=True, ephemeral=can_be_ephemeral)
-                        return
-
+                try:
+                    follow_up_text = await self.llm_client.process_tool_calls(tool_calls_aggregated, channel_history, channel_id, str(user_id), tool_call_result_hook, stream)
                     # Send Follow-up & Update History
                     if follow_up_text.strip():
                         logger.debug(f'Sending follow-up LLM response to channel {channel_id}', length=len(follow_up_text), stream=stream)
@@ -1125,6 +760,12 @@ class MCPCog(commands.Cog):
                     else:
                         logger.info(f'LLM follow-up call finished for channel {channel_id} with no text content.', stream=stream)
 
+                except MissingLLMResponseError as llm_err:
+                    await send_long_message(sendable, llm_err.message, followup=True, ephemeral=can_be_ephemeral)
+                    return
+                except Exception as e:
+                    await send_long_message(sendable, f'⚠️ Unexpected error getting follow-up AI response: {str(e)}', followup=True, ephemeral=can_be_ephemeral)
+                    return
 
         except Exception as e:
             logger.exception(f'Unhandled error during chat logic execution for channel {channel_id}', user_id=user_id, stream=stream)
@@ -1372,7 +1013,7 @@ class MCPCog(commands.Cog):
     @app_commands.describe(message='Your message to the AI', attachment='Optional file to discuss')
     @app_commands.checks.cooldown(1, 10, key=lambda i: i.user.id) # Cooldown per user
     async def chat_slash(self, interaction: discord.Interaction,
-        message: str, attachment: Optional[discord.Attachment] = None):
+        message: str, attachment: discord.Attachment | None = None):
         ''' Slash command version of the chat command. '''
         # Slash commands can technically be invoked in DMs if enabled globally or for DMs.
         # Let's keep it consistent and allow it, as _handle_chat_logic works fine.
@@ -1439,44 +1080,3 @@ class MCPCog(commands.Cog):
             logger.error(f'Failed to send slash command error message for interaction {interaction.id}: {e}')
         except Exception as e:
             logger.error(f'Generic exception sending slash command error for interaction {interaction.id}: {e}')
-
-def extract_tool_calls_from_content(content: str, assistant_message_dict: dict) -> list[dict]:
-    ''' Extracts tool calls from the content string. '''
-    import re
-    import json # Ensure json is imported
-
-    parsed_tool_calls = []
-    # Basic regex to find the JSON within the tags (adjust if needed)
-    matches = re.finditer(r'<tool_call>(.*?)</tool_call>', content, re.DOTALL)
-    for match in matches:
-        try:
-            tool_json_str = match.group(1).strip()
-            tool_data = json.loads(tool_json_str)
-            # Need to invent a tool_call_id if not provided by LLM text
-            tool_call_id = f'parsed_{uuid.uuid4()}'
-            if 'name' in tool_data and 'arguments' in tool_data:
-                 parsed_tool_calls.append({
-                     'id': tool_call_id,
-                     'type': 'function', # Assume function
-                     'function': {
-                         'name': tool_data['name'],
-                         # Ensure arguments are stringified if needed by later code
-                         'arguments': json.dumps(tool_data['arguments']) if isinstance(tool_data['arguments'], dict) else str(tool_data['arguments'])
-                     }
-                 })
-                 logger.info(f'Parsed text tool call: {tool_data['name']}')
-            else:
-                 logger.warning('Parsed tool call text missing name or arguments.', parsed_text=tool_json_str)
-        except json.JSONDecodeError:
-            logger.error('Failed to decode JSON from text tool call.', matched_text=match.group(1))
-        except Exception as parse_err:
-            logger.exception('Error parsing text tool call.', error=parse_err)
-
-    if parsed_tool_calls:
-        # Overwrite tool_calls_aggregated with the parsed ones
-        tool_calls_aggregated = parsed_tool_calls
-        # Optionally remove the <tool_call> text from initial_response_content
-        updated_content = re.sub(r'<tool_call>.*?</tool_call>', '', content, flags=re.DOTALL).strip()
-        assistant_message_dict['content'] = content # Update content if modified
-        logger.info(f'Proceeding with {len(tool_calls_aggregated)} tool calls parsed from text.')
-    return tool_calls_aggregated, updated_content

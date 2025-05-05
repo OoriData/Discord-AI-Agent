@@ -23,7 +23,7 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 
-dependencies = [
+dependencies = [  # https://hatch.pypa.io/latest/config/dependency/
     "discord>=2.3.2",
     "fire>=0.7.0",
     # "mcp>=1.6.0",
@@ -48,17 +48,16 @@ Documentation = "https://github.com/OoriData/Discord-AI-Agent#readme"
 Issues = "https://github.com/OoriData/Discord-AI-Agent/issues"
 Source = "https://github.com/OoriData/Discord-AI-Agent"
 
-# [tool.hatch.version]
-# path = "pylib/__about__.py"
+[tool.hatch.version]
+path = "pylib/__about__.py"
 
-# # Rewriting path in distribution
-# [tool.hatch.build.sources]
-# "pylib" = "discord_aiagent"
-# # "resources" = "discord_aiagent/resources"
+[tool.hatch.build]
+include = ["*.toml", "*.py"]
+# include = ["*.toml", "*.html", "*.py", "pylib/resource/**"]
 
-# [tool.hatch.build.targets.wheel]
-# only-include = ["pylib", "resources"]
+[tool.hatch.build.sources]  # Rewriting path in distribution
+"pylib" = "discord_aiagent"
 
-# [tool.hatch.build.targets.wheel.sources]
-# "pylib" = "discord_aiagent"
-# "resources" = "discord_aiagent/resources"
+# Include non-python files in the distribution https://hatch.pypa.io/latest/config/build/#forced-inclusion
+# [tool.hatch.build.targets.wheel.force-include]
+# 'pylib/resource' = 'discord_aiagent/resource'
