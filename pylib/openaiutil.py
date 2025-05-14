@@ -14,6 +14,13 @@ from mcp_sse_client import ToolInvocationResult
 
 logger = structlog.get_logger(__name__)
 
+def replace_system_prompt(messages, sysprommpt):
+    if messages[0]['role'] == 'system':
+        messages[0]['content'] = sysprommpt  # Yeah, just clobber it
+    else:
+        messages.insert(0, {'role': 'system', 'content': sysprommpt})
+    return
+
 
 def extract_tool_calls_from_content(content: str) -> tuple[list[dict], str]:
     ''' Extracts tool calls from the content string. '''
@@ -151,7 +158,7 @@ class OpenAILLMWrapper:
         self.llm_chat_params = chat_params
         self.tool_handler = tool_handler
 
-    async def __call__(self, messages: list[dict], user: str, extra_chat_params: dict, stream: bool = False):
+    async def __call__(self, messages: list[dict], user: str, extra_chat_params: dict,  stream: bool = False):
         '''
         Perform the LLM call using the provided parameters and channel history
         '''

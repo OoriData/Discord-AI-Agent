@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # discord_aiagent.discordutil
 import asyncio
+import datetime
 
 import discord
 from discord import abc as discord_abc
@@ -10,6 +11,24 @@ from discord.ext import commands
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+
+def get_formatted_sysmsg(sysmsg_template: str, discord_user_id: str | int) -> str:
+    '''
+    Formats the system message template with dynamic values.
+    '''
+    current_time_date_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')
+
+    # Prepare the data for formatting
+    format_data = {
+        'DISCORD_ID': str(discord_user_id),
+        'CURRENT_TIME_DATE': current_time_date_str
+    }
+
+    formatted_message = sysmsg_template.format_map(format_data)
+    logger.debug('Formatted system message', sysmsg=formatted_message)
+
+    return formatted_message
 
 
 async def send_long_message(sendable: commands.Context | discord.Interaction | discord_abc.Messageable, content: str, followup: bool = False, ephemeral: bool = False):

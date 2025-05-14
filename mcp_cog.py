@@ -45,8 +45,8 @@ except ImportError:
     class ReadTimeout(TimeoutError): pass
 
 from discord_aiagent.rssutil import RSSAgent
-from discord_aiagent.discordutil import send_long_message, handle_attachments
-from discord_aiagent.openaiutil import OpenAILLMWrapper, MissingLLMResponseError, LLMResponseError, ToolCallExecutionError
+from discord_aiagent.discordutil import send_long_message, handle_attachments, get_formatted_sysmsg
+from discord_aiagent.openaiutil import OpenAILLMWrapper, MissingLLMResponseError, LLMResponseError, ToolCallExecutionError, replace_system_prompt
 
 
 logger = structlog.get_logger(__name__)
@@ -110,12 +110,12 @@ class MCPCog(commands.Cog, RSSAgent):
         llm_chat_params.update(endpoint_chat_overrides)
         logger.info('LLM chat parameters configured', **llm_chat_params)
 
-        # Configure System Message
-        sysmsg = resolve_value(llm_endpoint_config.get('sysmsg', DEFAULT_SYSTEM_MESSAGE))
-        sys_postscript = resolve_value(llm_endpoint_config.get('sys_postscript', ''))
-        self.system_message = sysmsg + ('\n\n' + sys_postscript if sys_postscript else '')
-        logger.info('System message configured.', sysmsg_len=len(sysmsg), postscript_len=len(sys_postscript))
-        logger.debug(f'Full system message: {self.system_message}') # Debug level for full message
+        # Configure System Message Template and Postscript
+        self.sysmsg_template = resolve_value(llm_endpoint_config.get('sysmsg', DEFAULT_SYSTEM_MESSAGE))
+        print('sysmsg_template', self.sysmsg_template, flush=True)
+        self.sys_postscript = resolve_value(llm_endpoint_config.get('sys_postscript', ''))
+        logger.info('System message template configured.', template_len=len(self.sysmsg_template), postscript_len=len(self.sys_postscript))
+        logger.debug(f'System message template: {self.sysmsg_template}')
 
         try:
             self.llm_client = OpenAILLMWrapper(llm_init_params, llm_chat_params, self)
@@ -332,14 +332,13 @@ class MCPCog(commands.Cog, RSSAgent):
                 pg_messages.reverse() # Reverse to chronological
 
                 # Format for LLM (ensure 'role' and 'content' keys)
-                formatted_history = []
-                # Check if system message needs to be prepended manually or if it's stored
-                # Assuming it IS stored as the first message during insertion.
-                # If not, prepend: formatted_history = [{'role': 'system', 'content': self.system_message}]
-                # import pprint; pprint.pprint(pg_messages)
-                for msg in pg_messages:
-                    formatted_history.append({'role': msg['role'], 'content': msg['content']})
-
+                # Filter out any 'system' role messages, as the system message is now dynamic
+                # and prepended by the LLM wrapper.
+                formatted_history = [
+                    {'role': msg['role'], 'content': msg['content']}
+                    for msg in pg_messages if msg.get('role') != 'system'
+                ]
+                
                 logger.debug(f'Retrieved {len(formatted_history)} messages from PGVector for key {history_key}')
                 # Optional: Update in-memory cache as well? Or rely solely on DB?
                 # For simplicity, let's just return the DB result.
@@ -353,18 +352,27 @@ class MCPCog(commands.Cog, RSSAgent):
         logger.debug(f'Using in-memory history cache for channel {channel_id}')
         max_history_len = self.config.get('max_history_length', 20)
         if channel_id not in self.message_history:
-            self.message_history[channel_id] = [
-                {'role': 'system', 'content': self.system_message}
-            ]
+            # Initialize as an empty list; system message is handled dynamically
+            self.message_history[channel_id] = []
             logger.info(f'Initialized in-memory message history for channel {channel_id}')
         else:
+            # Trim history if it exceeds max_history_len
+            # System message is not part of this stored history.
             current_len = len(self.message_history[channel_id])
-            target_len = max_history_len + 1 # Keep system message + N history items
-            if current_len > target_len:
-                amount_to_remove = current_len - target_len
-                self.message_history[channel_id] = [self.message_history[channel_id][0]] + self.message_history[channel_id][amount_to_remove + 1:]
+            # target_len = max_history_len + 1 # Keep system message + N history items
+            # if current_len > target_len:
+            #     amount_to_remove = current_len - target_len
+            #     self.message_history[channel_id] = [self.message_history[channel_id][0]] + self.message_history[channel_id][amount_to_remove + 1:]
+
+            if current_len > max_history_len:
+                amount_to_remove = current_len - max_history_len
+                self.message_history[channel_id] = self.message_history[channel_id][amount_to_remove:]
                 logger.debug(f'Trimmed in-memory message history for channel {channel_id}, removed {amount_to_remove} messages.')
 
+        # Ensure no system messages are lingering, though ideally there shouldn't be any.
+        # return [msg for msg in self.message_history[channel_id] if msg.get('role') != 'system']
+
+        # Actually let replace_system_prompt take care of sysprompts
         return self.message_history[channel_id]
 
     async def execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> ToolInvocationResult | dict[str, str]:
@@ -611,22 +619,11 @@ class MCPCog(commands.Cog, RSSAgent):
             # Get and update history
             channel_history = await self._get_channel_history(channel_id)
 
-            # If history was just initialized (only contains system message) and PGVector is on, store system message.
-            # Do we want to store the system message in the DB?
-            # if self.pgvector_enabled and self.pgvector_db and len(channel_history) == 1 and channel_history[0]['role'] == 'system':
-            #      try:
-            #          logger.debug(f'Storing initial system message to PGVector for key: {history_key}')
-            #          await self.pgvector_db.insert(
-            #              history_key=history_key,
-            #              role='system',
-            #              content=channel_history[0]['content'],
-            #              metadata={'user_id': 'system'} # Example metadata
-            #          )
-            #      except Exception as e:
-            #          logger.exception(f'Failed to store initial system message to PGVector for key {history_key}.')
-
             user_message_dict = {'role': 'user', 'content': processed_message}
             channel_history.append(user_message_dict)
+            # Trim history again after adding new message (for in-memory, PGVector handles its limit)
+            # This call to _get_channel_history also applies trimming if needed for in-memory.
+            # channel_history = await self._get_channel_history(channel_id) # Re-fetch to apply trimming
             logger.debug(f'User message added to history for channel {channel_id}')
 
             if self.pgvector_enabled and self.pgvector_db:
@@ -653,8 +650,22 @@ class MCPCog(commands.Cog, RSSAgent):
                 extra_chat_params = {}
                 logger.debug(f'No active tools available for LLM call for channel {channel_id}')
 
+            # Format the system message dynamically
+            current_system_message = get_formatted_sysmsg(self.sysmsg_template, str(user_id))
+            if self.sys_postscript:
+                current_system_message += f'\n\n{self.sys_postscript}'
+            replace_system_prompt(channel_history, current_system_message)
+            print(channel_history, flush=True)
+
             try:
-                initial_response_content, tool_calls_aggregated = await self.llm_client(channel_history, str(user_id), extra_chat_params, stream=stream)
+                # Pass the dynamically formatted system message to the LLM client
+                # The channel_history should NOT contain a system message itself.
+                initial_response_content, tool_calls_aggregated = await self.llm_client(
+                    channel_history,
+                    str(user_id),  # For OpenAI 'user' field
+                    extra_chat_params,
+                    stream=stream
+                )
             except MissingLLMResponseError | LLMResponseError as llm_err:
                 await send_long_message(sendable, llm_err.message, followup=send_followup, ephemeral=can_be_ephemeral)
                 return
@@ -736,7 +747,8 @@ class MCPCog(commands.Cog, RSSAgent):
 
             if tool_calls_aggregated:
                 try:
-                    follow_up_text = await self.llm_client.process_tool_calls(tool_calls_aggregated, channel_history, channel_id, str(user_id), tool_call_result_hook, stream)
+                    follow_up_text = await self.llm_client.process_tool_calls(
+                        tool_calls_aggregated, channel_history, channel_id, str(user_id), tool_call_result_hook, stream)
                     # Send Follow-up & Update History
                     if follow_up_text.strip():
                         logger.debug(f'Sending follow-up LLM response to channel {channel_id}', length=len(follow_up_text), stream=stream)
