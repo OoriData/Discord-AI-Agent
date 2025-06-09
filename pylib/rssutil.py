@@ -22,13 +22,13 @@ class RSSAgent:
     async def execute_rss_query(self, tool_input: dict[str, Any]) -> dict[str, str]:
         '''Handles the execution of the 'query_rss_feed' tool.'''
         feed_name = tool_input.get('feed_name')
-        query = tool_input.get('query') # Optional query string
-        limit = tool_input.get('limit', 5) # Default limit
+        query = tool_input.get('query')  # Optional query string
+        limit = tool_input.get('limit', 5)  # Default limit
 
         if not feed_name:
             return {'error': 'Missing required parameter: feed_name'}
         if not isinstance(limit, int) or limit < 1:
-            limit = 5 # Default to 5 if invalid limit provided
+            limit = 5  # Default to 5 if invalid limit provided
 
         # Find the RSSConfig
         rss_conf = next((conf for conf in self.b4a_data.rss_sources if conf.name == feed_name), None)

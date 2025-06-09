@@ -8,8 +8,11 @@ and provides commands to interact with MCP tools via an LLM.
 import os
 import json
 import asyncio
-from typing import Any
+from typing import Any, List
 import uuid
+import time  # For current time
+from dataclasses import dataclass, field
+from enum import Enum
 # import time
 # import traceback
 
@@ -17,7 +20,7 @@ import discord
 from discord import app_commands, abc as discord_abc
 from discord.ext import commands
 
-import structlog
+import structlog  # type: ignore
 # Openai types might be useful for clarity
 from ogbujipt.embedding.pgvector import MessageDB
 
@@ -25,7 +28,7 @@ from mcp_sse_client import MCPClient, ToolDef, ToolInvocationResult, ToolParamet
 from b4a_config import B4ALoader, MCPConfig, resolve_value
 from source_handlers import FEEDPARSER_AVAILABLE
 
-# XXX: Clean up exception handling & imports by better study of mcp-sse-client
+# XXX: Clean up exception handling & imports by better study of mcp-sse-client  # pylint: disable=fixme
 # Needed for ClosedResourceError/BrokenResourceError handling if not imported via sse/mcp
 # MCPClient might raise its own connection errors or underlying httpx/anyio errors
 # We'll catch broader exceptions initially and refine if needed.
@@ -47,6 +50,7 @@ except ImportError:
 from discord_aiagent.rssutil import RSSAgent
 from discord_aiagent.discordutil import send_long_message, handle_attachments, get_formatted_sysmsg
 from discord_aiagent.openaiutil import OpenAILLMWrapper, MissingLLMResponseError, LLMResponseError, ToolCallExecutionError, replace_system_prompt
+from discord.ext import tasks  # Ensure tasks is imported
 
 
 logger = structlog.get_logger(__name__)
@@ -55,8 +59,8 @@ logger = structlog.get_logger(__name__)
 # Generated one-time by Uche using uuid.uuid4()
 DISCORD_CHANNEL_HISTORY_NAMESPACE = uuid.UUID('faa9e9c4-1f01-4e27-933d-6460b8924924')
 
-ALLOWED_FOR_LLM_INIT = ['base_url', 'api_key'] # Adjusted for openai > 1.0
-ALLOWED_FOR_LLM_CHAT = ['model', 'temperature', 'max_tokens', 'top_p'] # Added common chat params
+ALLOWED_FOR_LLM_INIT = ['base_url', 'api_key']  # Adjusted for openai > 1.0
+ALLOWED_FOR_LLM_CHAT = ['model', 'temperature', 'max_tokens', 'top_p']  # Added common chat params
 
 # FIXME: Use Word Loom
 DEFAULT_SYSTEM_MESSAGE = 'You are a helpful AI assistant. When you need to use a tool, you MUST use the provided function-calling mechanism. Do NOT simply describe the tool call in your text response.'
@@ -64,16 +68,44 @@ DEFAULT_SYSTEM_MESSAGE = 'You are a helpful AI assistant. When you need to use a
 # API Key Handling - ensure OPENAI_API_KEY is checked/set if needed by the AsyncOpenAI client
 # The logic in __init__ already handles this using the config/env var.
 
-os.environ['TOKENIZERS_PARALLELISM'] = 'false' # Disable parallelism for tokenizers to avoid warnings
+# Define schedule types and their durations in seconds
+class ScheduleType(str, Enum):  # Inherit from str for app_commands.Choice compatibility
+    EVERY_5_MINUTES = "Every 5 minutes"
+    HOURLY = "Hourly"
+    DAILY = "Daily"
+    WEEKLY = "Weekly"
+
+SCHEDULE_DURATIONS = {
+    ScheduleType.EVERY_5_MINUTES: 5 * 60,
+    ScheduleType.HOURLY: 60 * 60,
+    ScheduleType.DAILY: 24 * 60 * 60,
+    ScheduleType.WEEKLY: 7 * 24 * 60 * 60,
+}
+
+@dataclass
+class StandingPrompt:
+    schedule_type: ScheduleType
+    prompt_text: str
+    channel_id: int
+    user_id: int  # User who initiated this standing prompt
+    id: uuid.UUID = field(default_factory=uuid.uuid4)
+    created_at: float = field(default_factory=time.time)
+    last_run_time: float = 0.0  # Timestamp of last execution
+
+    @property
+    def interval_seconds(self) -> int:
+        return SCHEDULE_DURATIONS.get(self.schedule_type, 0)
+
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Disable parallelism for tokenizers to avoid warnings
 
 
 class MCPCog(commands.Cog, RSSAgent):
     def __init__(self, bot: commands.Bot, config: dict[str, Any], b4a_data: B4ALoader, pgvector_config: dict[str, Any]):
-        RSSAgent.__init__(self, b4a_data, {}, 0) # Initialize RSSAgent with empty cache
+        RSSAgent.__init__(self, b4a_data, {}, 0)  # Initialize RSSAgent with empty cache
         self.bot = bot
         self.config = config  # Agent config (LLM, etc.)
         self.mcp_connections: dict[str, MCPClient] = {}  # Keyed by MCPConfig.name
-        self.mcp_tools: dict[str, list[ToolDef]] = {}  # Keyed by MCPConfig.name
+        self.mcp_tools: dict[str, List[ToolDef]] = {}  # Keyed by MCPConfig.name
         self.message_history: dict[int, list[dict[str, Any]]] = {}
 
         self._connection_tasks: dict[str, asyncio.Task] = {}
@@ -84,7 +116,9 @@ class MCPCog(commands.Cog, RSSAgent):
         self.pgvector_enabled = self.pgvector_config.get('enabled', False)
 
         self._rss_feed_cache: dict[str, tuple[float, Any]] = {}
-        self._rss_cache_ttl: int = self.config.get('rss_cache_ttl', 300) # Default 5 mins, configurable in agent TOML
+        self._rss_cache_ttl: int = self.config.get('rss_cache_ttl', 300)  # Default 5 mins, configurable in agent TOML
+
+        self.standing_prompts: List[StandingPrompt] = []
 
         # LLM Client and Parameter Initialization
         llm_endpoint_config = self.config.get('llm_endpoint', {})
@@ -93,14 +127,14 @@ class MCPCog(commands.Cog, RSSAgent):
         # Initialize LLM Client
         llm_init_params = {k: resolve_value(v) for k, v in llm_endpoint_config.items() if k in ALLOWED_FOR_LLM_INIT}
         if 'api_key' not in llm_init_params:
-            llm_init_params['api_key'] = 'missing-key' # Or handle error
+            llm_init_params['api_key'] = 'missing-key'  # Or handle error
         if not llm_init_params.get('base_url'):
             raise ValueError('LLM \'base_url\' is required.')
 
         # Configure LLM Chat Parameters (Combine defaults, model_params, llm_endpoint)
         llm_chat_params = {
-             'model': llm_endpoint_config.get('label', 'local-model'), # Default model name
-             'temperature': 0.3, 'max_tokens': 1000, # Base defaults
+             'model': llm_endpoint_config.get('label', 'local-model'),  # Default model name
+             'temperature': 0.3, 'max_tokens': 1000,  # Base defaults
         }
         # Apply overrides from [model_params] first
         model_param_overrides = {k: resolve_value(v) for k, v in model_params_config.items() if k in ALLOWED_FOR_LLM_CHAT}
@@ -136,9 +170,9 @@ class MCPCog(commands.Cog, RSSAgent):
     async def _manage_mcp_connection(self, mcp_config: MCPConfig):
         '''Persistent task to manage a single MCP connection using MCPClient.'''
         url = mcp_config.url
-        name = mcp_config.name # Use the name from B4A config
-        reconnect_delay = 15 # Initial delay seconds
-        max_reconnect_delay = 300 # Max delay seconds
+        name = mcp_config.name  # Use the name from B4A config
+        reconnect_delay = 15  # Initial delay seconds
+        max_reconnect_delay = 300  # Max delay seconds
 
         while not self._shutdown_event.is_set():
             logger.info(f'Attempting connection for MCP source: \'{name}\'', url=url)
@@ -156,7 +190,7 @@ class MCPCog(commands.Cog, RSSAgent):
                 self.mcp_connections[name] = client
                 self.mcp_tools[name] = tools_list
                 logger.info(f'Connected to MCP source \'{name}\' and listed {len(tools_list)} tools.', server_name=name)
-                reconnect_delay = 15 # Reset delay on success
+                reconnect_delay = 15  # Reset delay on success
 
                 # Connection Maintenance (MCPClient handles underlying keep-alive/SSE)
                 # Just need to wait until shutdown or an error occurs during a tool call.
@@ -172,7 +206,7 @@ class MCPCog(commands.Cog, RSSAgent):
                 logger.error(f'Timeout connecting or listing tools for MCP server {name}. Retrying…', server_name=name)
             except asyncio.CancelledError:
                 logger.info(f'Connection task for {name} cancelled.')
-                break # Exit loop immediately
+                break  # Exit loop immediately
             except Exception as e:
                 # Catch other errors from MCPClient init or list_tools
                 logger.exception(f'Unexpected error managing connection for {name}. Retrying…', server_name=name, url=url)
@@ -194,12 +228,12 @@ class MCPCog(commands.Cog, RSSAgent):
                 try:
                     await asyncio.wait_for(self._shutdown_event.wait(), timeout=reconnect_delay)
                     logger.info(f'Shutdown signaled during reconnect delay for {name}.')
-                    break # Exit loop if shutdown signaled
+                    break  # Exit loop if shutdown signaled
                 except asyncio.TimeoutError:
-                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay) # Exponential backoff
+                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)  # Exponential backoff
                 except asyncio.CancelledError:
                      logger.info(f'Reconnect wait for {name} cancelled.')
-                     break # Exit loop
+                     break  # Exit loop
 
         # Final Task Cleanup (on shutdown or cancellation)
         logger.info(f'Connection management task for {name} finished cleanly.')
@@ -212,7 +246,7 @@ class MCPCog(commands.Cog, RSSAgent):
         Set up MCP connections when the cog is loaded by starting persistent tasks.
         '''
         logger.info('Loading MCPCog and starting connection managers…')
-        self._shutdown_event.clear() # Ensure shutdown is not set initially
+        self._shutdown_event.clear()  # Ensure shutdown is not set initially
 
         if self.pgvector_enabled and self.pgvector_db is None:
             logger.info('Initializing PGVector MessageDB connection...')
@@ -249,13 +283,13 @@ class MCPCog(commands.Cog, RSSAgent):
                 self.pgvector_enabled = False
                 self.pgvector_db = None
 
-        mcp_source_configs = self.b4a_data.mcp_sources # Get sources from B4A data
+        mcp_source_configs = self.b4a_data.mcp_sources  # Get sources from B4A data
         if not mcp_source_configs:
             logger.warning('No valid @mcp B4A sources loaded. No MCP connections will be established.')
             return
 
         active_task_count = 0
-        for mcp_conf in mcp_source_configs: # Iterate B4A sources
+        for mcp_conf in mcp_source_configs:  # Iterate B4A sources
             name = mcp_conf.name
             if name not in self._connection_tasks or self._connection_tasks[name].done():
                 logger.info(f'Creating connection task for B4A MCP source: \'{name}\'', url=mcp_conf.url)
@@ -268,6 +302,8 @@ class MCPCog(commands.Cog, RSSAgent):
                 active_task_count += 1
 
         logger.info(f'MCPCog load processed. {active_task_count} connection tasks are active or starting.')
+        self.standing_prompt_loop.start()
+        logger.info('Standing prompt loop started.')
 
     async def cog_unload(self):
         '''
@@ -275,7 +311,7 @@ class MCPCog(commands.Cog, RSSAgent):
         '''
         # XXX Shouldn't be eny PGVector Cleanup needed, but maybe set self.pgvector_db to None?
         logger.info('Unloading MCPCog and stopping connection tasks…')
-        self._shutdown_event.set() # Signal all tasks to stop their loops
+        self._shutdown_event.set()  # Signal all tasks to stop their loops
 
         tasks_to_wait_for = list(self._connection_tasks.values())
 
@@ -309,8 +345,10 @@ class MCPCog(commands.Cog, RSSAgent):
         # Clear stored data regardless of task shutdown status
         self.mcp_connections.clear()
         self.mcp_tools.clear()
-        self._connection_tasks.clear() # Clear task references
+        self._connection_tasks.clear()  # Clear task references
         self._rss_feed_cache.clear()
+        self.standing_prompt_loop.cancel()
+        logger.info('Standing prompt loop stopped.')
         logger.info('MCPCog unloaded and connection resources cleared.')
 
     async def _get_channel_history(self, channel_id: int) -> list[dict[str, Any]]:
@@ -329,7 +367,7 @@ class MCPCog(commands.Cog, RSSAgent):
                 pg_messages_gen = await self.pgvector_db.get_messages(history_key=history_key, limit=20)
                 # Convert generator to list and reverse it to get chronological order
                 pg_messages = list(pg_messages_gen)
-                pg_messages.reverse() # Reverse to chronological
+                pg_messages.reverse()  # Reverse to chronological
 
                 # Format for LLM (ensure 'role' and 'content' keys)
                 # Filter out any 'system' role messages, as the system message is now dynamic
@@ -338,11 +376,11 @@ class MCPCog(commands.Cog, RSSAgent):
                     {'role': msg['role'], 'content': msg['content']}
                     for msg in pg_messages if msg.get('role') != 'system'
                 ]
-                
+
                 logger.debug(f'Retrieved {len(formatted_history)} messages from PGVector for key {history_key}')
                 # Optional: Update in-memory cache as well? Or rely solely on DB?
                 # For simplicity, let's just return the DB result.
-                # self.message_history[channel_id] = formatted_history # Update cache
+                # self.message_history[channel_id] = formatted_history  # Update cache
                 return formatted_history
             except Exception as e:
                 logger.exception(f'Error retrieving history from PGVector for key {history_key}. Falling back to in-memory.')
@@ -359,7 +397,7 @@ class MCPCog(commands.Cog, RSSAgent):
             # Trim history if it exceeds max_history_len
             # System message is not part of this stored history.
             current_len = len(self.message_history[channel_id])
-            # target_len = max_history_len + 1 # Keep system message + N history items
+            # target_len = max_history_len + 1  # Keep system message + N history items
             # if current_len > target_len:
             #     amount_to_remove = current_len - target_len
             #     self.message_history[channel_id] = [self.message_history[channel_id][0]] + self.message_history[channel_id][amount_to_remove + 1:]
@@ -428,12 +466,12 @@ class MCPCog(commands.Cog, RSSAgent):
                 logger.warning(f'Tool `{tool_name}` executed but reported an error.', error_code=result.error_code, content=result.content)
                 # Format the error content for the user/LLM
                 error_message = f'Tool reported error code {result.error_code}'
-                if result.content: # Include content if provided with the error
+                if result.content:  # Include content if provided with the error
                      error_message += f': {str(result.content)}'
-                return {'error': error_message} # Return standard error dict
+                return {'error': error_message}  # Return standard error dict
 
             # If error_code is None or 0, it's a success
-            return result # Return the successful ToolInvocationResult object
+            return result  # Return the successful ToolInvocationResult object
 
         except asyncio.TimeoutError:
              logger.error(f'Timeout calling MCP tool `{tool_name}` on server `{server_name_found}`', tool_input=tool_input)
@@ -445,7 +483,7 @@ class MCPCog(commands.Cog, RSSAgent):
             logger.error(f'Connection error during MCP tool call `{tool_name}` on server `{server_name_found}`: {type(conn_err).__name__}', tool_input=tool_input, error=str(conn_err))
             # Remove the client reference; the management task will handle reconnection.
             if server_name_found in self.mcp_connections: del self.mcp_connections[server_name_found]
-            if server_name_found in self.mcp_tools: del self.mcp_tools[server_name_found] # Also clear tools
+            if server_name_found in self.mcp_tools: del self.mcp_tools[server_name_found]  # Also clear tools
             return {'error': f'Connection error executing MCP tool `{tool_name}`. The server may be temporarily unavailable. Please try again.'}
         except Exception as e:
             logger.exception(f'Unexpected error calling tool `{tool_name}` on server `{server_name_found}`', tool_input=tool_input)
@@ -459,11 +497,11 @@ class MCPCog(commands.Cog, RSSAgent):
             'integer': 'integer',
             'number': 'number',
             'boolean': 'boolean',
-            'array': 'array', # Assuming direct mapping for array/object might need refinement
+            'array': 'array',  # Assuming direct mapping for array/object might need refinement
             'object': 'object',
             # Add other mappings if MCP uses different type names
         }
-        json_type = type_map.get(mcp_type.lower(), 'string') # Default to string if unknown
+        json_type = type_map.get(mcp_type.lower(), 'string')  # Default to string if unknown
         if json_type != mcp_type.lower():
             logger.debug(f'Mapped MCP type `{mcp_type}` to JSON type `{json_type}`.')
         return json_type
@@ -500,7 +538,7 @@ class MCPCog(commands.Cog, RSSAgent):
 
                         param_schema = {
                             'type': self._map_mcp_type_to_json_type(param.parameter_type),
-                            'description': param.description or f'Parameter {param.name}' # Add default desc
+                            'description': param.description or f'Parameter {param.name}'  # Add default desc
                         }
                         # Add enum if present (assuming param.enum is a list)
                         if hasattr(param, 'enum') and isinstance(param.enum, list) and param.enum:
@@ -543,7 +581,7 @@ class MCPCog(commands.Cog, RSSAgent):
                     'type': 'function',
                     'function': {
                         'name': tool.name,
-                        'description': tool.description or f'Executes the {tool.name} tool.', # Default desc
+                        'description': tool.description or f'Executes the {tool.name} tool.',  # Default desc
                         'parameters': parameters_schema,
                     },
                 }
@@ -565,7 +603,7 @@ class MCPCog(commands.Cog, RSSAgent):
                                 'feed_name': {
                                     'type': 'string',
                                     'description': 'The name of the configured RSS feed to query.',
-                                    'enum': rss_feed_names # Use loaded feed names
+                                    'enum': rss_feed_names  # Use loaded feed names
                                 },
                                 'query': {
                                     'type': 'string',
@@ -576,7 +614,7 @@ class MCPCog(commands.Cog, RSSAgent):
                                     'description': 'Optional: The maximum number of entries to return (default is 5).'
                                 }
                             },
-                            'required': ['feed_name'] # Only feed_name is strictly required
+                            'required': ['feed_name']  # Only feed_name is strictly required
                         }
                     }
                 }
@@ -607,9 +645,9 @@ class MCPCog(commands.Cog, RSSAgent):
 
         # Ephemeral only makes sense for interactions
         can_be_ephemeral = is_interaction
-        processed_message = message # Start with the original text message
+        processed_message = message  # Start with the original text message
 
-        history_key = uuid.uuid5(DISCORD_CHANNEL_HISTORY_NAMESPACE, str(channel_id)) # Generate UUID key once
+        history_key = uuid.uuid5(DISCORD_CHANNEL_HISTORY_NAMESPACE, str(channel_id))  # Generate UUID key once
 
         if attachments:
             logger.info(f'Processing {len(attachments)} attachments for channel {channel_id}', user_id=user_id)
@@ -623,7 +661,7 @@ class MCPCog(commands.Cog, RSSAgent):
             channel_history.append(user_message_dict)
             # Trim history again after adding new message (for in-memory, PGVector handles its limit)
             # This call to _get_channel_history also applies trimming if needed for in-memory.
-            # channel_history = await self._get_channel_history(channel_id) # Re-fetch to apply trimming
+            # channel_history = await self._get_channel_history(channel_id)  # Re-fetch to apply trimming
             logger.debug(f'User message added to history for channel {channel_id}')
 
             if self.pgvector_enabled and self.pgvector_db:
@@ -632,14 +670,14 @@ class MCPCog(commands.Cog, RSSAgent):
                     metadata = {'user_id': str(user_id), 'discord_role': 'user'}
                     await self.pgvector_db.insert(
                         history_key=history_key,
-                        role='user', # Store standard role
+                        role='user',  # Store standard role
                         content=processed_message,
                         metadata=metadata
                     )
                 except Exception as e:
                     logger.exception(f'Failed to store user message to PGVector for key {history_key}.')
 
-            openai_tools = await self.format_tools_for_openai() # Gets both MCP and RSS tools
+            openai_tools = await self.format_tools_for_openai()  # Gets both MCP and RSS tools
             if openai_tools:
                 extra_chat_params = {
                     'tools': openai_tools,
@@ -669,7 +707,7 @@ class MCPCog(commands.Cog, RSSAgent):
             except MissingLLMResponseError | LLMResponseError as llm_err:
                 await send_long_message(sendable, llm_err.message, followup=send_followup, ephemeral=can_be_ephemeral)
                 return
-            except Exception as e: # Catch other unexpected errors (e.g., network)
+            except Exception as e:  # Catch other unexpected errors (e.g., network)
                 logger.exception('Unexpected error during LLM communication', channel_id=channel_id, user_id=user_id)
                 await send_long_message(sendable, f'⚠️ Unexpected error communicating with AI: {str(e)}', followup=send_followup, ephemeral=can_be_ephemeral)
                 return
@@ -680,9 +718,9 @@ class MCPCog(commands.Cog, RSSAgent):
             if initial_response_content.strip():
                 logger.debug(f'Sending initial LLM response to channel {channel_id}', length=len(initial_response_content), stream=stream)
                 await send_long_message(sendable, initial_response_content, followup=send_followup)
-                assistant_message_dict['content'] = initial_response_content # Ephemeral handled by send_long_message
+                assistant_message_dict['content'] = initial_response_content  # Ephemeral handled by send_long_message
                 sent_initial_message = True
-                send_followup = True # Any subsequent messages MUST be followups
+                send_followup = True  # Any subsequent messages MUST be followups
 
             if tool_calls_aggregated:
                 assistant_message_dict['tool_calls'] = tool_calls_aggregated
@@ -690,7 +728,7 @@ class MCPCog(commands.Cog, RSSAgent):
 
             if assistant_message_dict.get('content') or assistant_message_dict.get('tool_calls'):
                 channel_history.append(assistant_message_dict)
-                sent_initial_message = True # Flag if we added *something* from the assistant
+                sent_initial_message = True  # Flag if we added *something* from the assistant
 
                 # PGVector Insertion: Assistant Message / Tool Call Request
                 if self.pgvector_enabled and self.pgvector_db:
@@ -703,11 +741,11 @@ class MCPCog(commands.Cog, RSSAgent):
 
                         metadata = {'user_id': str(self.bot.user.id), 'discord_role': 'assistant'}
                         if assistant_message_dict.get('tool_calls'):
-                            metadata['tool_calls'] = assistant_message_dict['tool_calls'] # Store tool calls in metadata
+                            metadata['tool_calls'] = assistant_message_dict['tool_calls']  # Store tool calls in metadata
 
                         await self.pgvector_db.insert(
                             history_key=history_key,
-                            role='assistant', # Standard role
+                            role='assistant',  # Standard role
                             content=content_to_insert,
                             metadata=metadata
                         )
@@ -739,7 +777,7 @@ class MCPCog(commands.Cog, RSSAgent):
                         await self.pgvector_db.insert(
                             history_key=history_key,
                             role='tool',
-                            content=tool_result_content_formatted, # Store formatted result
+                            content=tool_result_content_formatted,  # Store formatted result
                             metadata=metadata
                         )
                     except Exception as e:
@@ -752,7 +790,7 @@ class MCPCog(commands.Cog, RSSAgent):
                     # Send Follow-up & Update History
                     if follow_up_text.strip():
                         logger.debug(f'Sending follow-up LLM response to channel {channel_id}', length=len(follow_up_text), stream=stream)
-                        await send_long_message(sendable, follow_up_text, followup=True) # Must be followup
+                        await send_long_message(sendable, follow_up_text, followup=True)  # Must be followup
                         follow_up_dict = {'role': 'assistant', 'content': follow_up_text}
                         channel_history.append(follow_up_dict)
 
@@ -837,11 +875,11 @@ class MCPCog(commands.Cog, RSSAgent):
         # Use typing context manager for user feedback in the DM channel
         async with message.channel.typing():
             await self._handle_chat_logic(
-                sendable=message.channel, # Pass the DMChannel directly
+                sendable=message.channel,  # Pass the DMChannel directly
                 message=message.content,
                 channel_id=message.channel.id,
                 user_id=message.author.id,
-                stream=False, # Defaulting DMs to non-streaming for simplicity
+                stream=False,  # Defaulting DMs to non-streaming for simplicity
                 attachments=message.attachments
             )
     # Discord Commands (mcp_list, chat_command, chat_slash)
@@ -868,7 +906,7 @@ class MCPCog(commands.Cog, RSSAgent):
             elif name in self._connection_tasks and not self._connection_tasks[name].done():
                 status_icon = '🟠'; status_text = 'Connecting…'
             else:
-                status_icon = '🔴'; status_text = 'Disconnected / Failed' # Assumes task finished if not connecting
+                status_icon = '🔴'; status_text = 'Disconnected / Failed'  # Assumes task finished if not connecting
             message += f'- **{name}**: {status_icon} {status_text} ({mcp_conf.url})\n'
         message += '\n'
 
@@ -897,7 +935,7 @@ class MCPCog(commands.Cog, RSSAgent):
         # Loading Errors
         if self.b4a_data.load_errors:
             message += f'**Loading Errors: {len(self.b4a_data.load_errors)} encountered**\n'
-            for path, err in self.b4a_data.load_errors[:5]: # Show first 5 errors
+            for path, err in self.b4a_data.load_errors[:5]:  # Show first 5 errors
                 message += f'- `{os.path.basename(path)}`: {err[:150]}…\n'
             if len(self.b4a_data.load_errors) > 5: message += '- … (see logs for more details)\n'
             message += '\n'
@@ -942,7 +980,7 @@ class MCPCog(commands.Cog, RSSAgent):
                 if tools_available:
                     message_parts.append('  *Available Tools:*')
                     for tool in self.mcp_tools[name]:
-                        desc = (tool.description or 'No description').split('\n')[0] # First line of desc
+                        desc = (tool.description or 'No description').split('\n')[0]  # First line of desc
                         desc_short = (desc[:70] + '...') if len(desc) > 70 else desc
                         message_parts.append(f'    - `{tool.name}`: {desc_short}')
                 elif status_icon == '🟢' and not tools_available:
@@ -1003,7 +1041,7 @@ class MCPCog(commands.Cog, RSSAgent):
                 message=message,
                 channel_id=channel_id,
                 user_id=user_id,
-                stream=False, # Keep Prefix non-streaming for simplicity
+                stream=False,  # Keep Prefix non-streaming for simplicity
                 attachments=attachments
             )
 
@@ -1014,7 +1052,7 @@ class MCPCog(commands.Cog, RSSAgent):
             await ctx.send(f'⏳ Woah there! This command is on cooldown. Try again in {error.retry_after:.1f} seconds.', delete_after=10)
         elif isinstance(error, commands.MissingRequiredArgument):
             await ctx.send(f'⚠️ You need to provide a message! Usage: `{ctx.prefix}chat <your message>`')
-        elif isinstance(error, commands.NoPrivateMessage): # Should be caught by the check in the command now
+        elif isinstance(error, commands.NoPrivateMessage):  # Should be caught by the check in the command now
             await ctx.send('This prefix command cannot be used in DMs. Just send your message directly!')
         else:
             logger.error(f'Error in prefix command chat_command dispatch: {error}', exc_info=error)
@@ -1023,7 +1061,7 @@ class MCPCog(commands.Cog, RSSAgent):
     # Slash form
     @app_commands.command(name='chat', description='Chat with the AI assistant')
     @app_commands.describe(message='Your message to the AI', attachment='Optional file to discuss')
-    @app_commands.checks.cooldown(1, 10, key=lambda i: i.user.id) # Cooldown per user
+    @app_commands.checks.cooldown(1, 10, key=lambda i: i.user.id)  # Cooldown per user
     async def chat_slash(self, interaction: discord.Interaction,
         message: str, attachment: discord.Attachment | None = None):
         ''' Slash command version of the chat command. '''
@@ -1048,14 +1086,14 @@ class MCPCog(commands.Cog, RSSAgent):
             logger.info(f'Slash command /chat received an attachment: {attachment.filename}')
 
         # Defer response
-        await interaction.response.defer(thinking=True, ephemeral=False) # Non-ephemeral for public results
+        await interaction.response.defer(thinking=True, ephemeral=False)  # Non-ephemeral for public results
 
         await self._handle_chat_logic(
             sendable=interaction,
             message=message,
             channel_id=channel_id,
             user_id=user_id,
-            stream=False, # Keep Slash non-streaming for now
+            stream=False,  # Keep Slash non-streaming for now
             attachments=attachments_list
         )
 
@@ -1067,14 +1105,14 @@ class MCPCog(commands.Cog, RSSAgent):
              return
 
         error_message = 'An unexpected error occurred with this command.'
-        ephemeral = True # Most check errors should be ephemeral
+        ephemeral = True  # Most check errors should be ephemeral
 
         if isinstance(error, app_commands.CommandOnCooldown):
             error_message = f'⏳ Woah there! This command is on cooldown. Try again in {error.retry_after:.1f} seconds.'
         elif isinstance(error, app_commands.CheckFailure):
             error_message = 'You don\'t have the necessary permissions or conditions met to use this command.'
             logger.warning(f'CheckFailure for /chat by {interaction.user}: {error}')
-        # elif isinstance(error, app_commands.NoPrivateMessage): # If we added a guild_only check
+        # elif isinstance(error, app_commands.NoPrivateMessage):  # If we added a guild_only check
         #      error_message = 'This command cannot be used in Direct Messages.'
         else:
             # Log other errors (before our main logic runs)
@@ -1090,5 +1128,77 @@ class MCPCog(commands.Cog, RSSAgent):
                 await interaction.response.send_message(error_message, ephemeral=ephemeral)
         except discord.HTTPException as e:
             logger.error(f'Failed to send slash command error message for interaction {interaction.id}: {e}')
-        except Exception as e:
-            logger.error(f'Generic exception sending slash command error for interaction {interaction.id}: {e}')
+        except Exception as e_generic:  # More specific variable name
+            logger.error(f'Generic exception sending slash command error for interaction {interaction.id}: {e_generic}')
+
+    # Standing Prompt Task Loop
+    @tasks.loop(seconds=60)  # Check every 60 seconds
+    async def standing_prompt_loop(self):
+        # await self.bot.wait_until_ready()  # Handled by before_loop
+        current_time = time.time()
+        logger.debug(f'Standing prompt loop running at {current_time}. Checking {len(self.standing_prompts)} prompts.')
+
+        for sp in self.standing_prompts:
+            if sp.interval_seconds <= 0:
+                logger.warning(f'Standing prompt {sp.id} has invalid interval ({sp.interval_seconds}s). Skipping.')
+                continue
+
+            is_due = False
+            if sp.last_run_time == 0.0:  # Never run before
+                if current_time >= (sp.created_at + sp.interval_seconds):
+                    is_due = True
+            else:  # Has run before
+                if current_time >= (sp.last_run_time + sp.interval_seconds):
+                    is_due = True
+
+            if is_due:
+                logger.info(f'Standing prompt {sp.id} for channel {sp.channel_id} is due. Text: "{sp.prompt_text[:50]}..."')
+                # Update last_run_time *before* execution to prevent rapid retries on failure
+                sp.last_run_time = current_time  # Mark as "attempted to run"
+
+                channel = self.bot.get_channel(sp.channel_id)
+                if not channel:
+                    logger.warning(f'Channel {sp.channel_id} for standing prompt {sp.id} not found. Skipping.')
+                    continue
+                if not isinstance(channel, discord_abc.Messageable):  # Should be TextChannel or similar
+                    logger.warning(f'Channel {sp.channel_id} for standing prompt {sp.id} is not messageable. Type: {type(channel)}. Skipping.')
+                    continue
+
+                try:
+                    await channel.send(f'🤖 Running scheduled prompt from <@{sp.user_id}>: "{sp.prompt_text}"')
+                    await self._handle_chat_logic(
+                        sendable=channel,
+                        message=sp.prompt_text,
+                        channel_id=sp.channel_id,
+                        user_id=sp.user_id,
+                        stream=False,  # Scheduled tasks likely better non-streamed
+                        attachments=None
+                    )
+                    logger.info(f'Successfully ran standing prompt {sp.id}. Next run roughly in {sp.interval_seconds}s from now.')
+                except Exception as e:
+                    logger.exception(f'Error executing standing prompt {sp.id} for channel {sp.channel_id}: {e}')
+                    try:
+                        await channel.send(f'⚠️ Error running scheduled prompt: "{sp.prompt_text}". Will try again at the next scheduled interval. Please check bot logs.')
+                    except Exception as send_err:
+                        logger.error(f'Failed to send error message for standing prompt {sp.id} to channel {sp.channel_id}: {send_err}')
+
+    @standing_prompt_loop.before_loop
+    async def before_standing_prompt_loop(self):
+        logger.info('Waiting for bot to be ready before starting standing_prompt_loop...')
+        await self.bot.wait_until_ready()
+        logger.info('Bot is ready. standing_prompt_loop will start.')
+
+    @app_commands.command(name='set_standing_prompt', description='Set a recurring prompt for the bot in this channel.')
+    @app_commands.describe(schedule='How often should this prompt run?', prompt='The prompt text for the AI.')
+    @app_commands.choices(schedule=[app_commands.Choice(name=st.value, value=st.value) for st in ScheduleType])
+    async def set_standing_prompt_slash(self, interaction: discord.Interaction, schedule: app_commands.Choice[str], prompt: str):
+        logger.info(f'Command /set_standing_prompt invoked by {interaction.user} in channel {interaction.channel_id}')
+        if not interaction.channel_id or not interaction.channel:  # Ensure channel context
+            await interaction.response.send_message('This command must be used in a valid channel.', ephemeral=True)
+            return
+
+        selected_schedule_type = ScheduleType(schedule.value)  # schedule.value is the string from ScheduleType enum
+        new_prompt = StandingPrompt(schedule_type=selected_schedule_type, prompt_text=prompt, channel_id=interaction.channel_id, user_id=interaction.user.id)
+        self.standing_prompts.append(new_prompt)
+        logger.info(f'New standing prompt added: ID {new_prompt.id}, Schedule: {new_prompt.schedule_type.value}, Channel: {new_prompt.channel_id}, User: {new_prompt.user_id}')
+        await interaction.response.send_message(f'✅ Standing prompt set! I will ask "{prompt[:100]}..." {selected_schedule_type.value.lower()} in this channel.\nPrompt ID: `{new_prompt.id}` (for future management).', ephemeral=False)

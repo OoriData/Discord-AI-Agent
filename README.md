@@ -85,7 +85,7 @@ You can either use a connection string or elaborated credentials.
 
 ### Configure with DB connection string:
 
-Make sure it's in the `AIBOT_PG_CONNECT_STRING` environment variable. If this variable exists, it will supersede any other PG env vars.
+Make sure it's in the `AIBOT_PG_USER_CONNECT_STRING` environment variable. If this variable exists, it will supersede any other PG env vars.
 
 ### Configure with DB connection components
 
@@ -186,7 +186,7 @@ You can use the "Connect" icon at the top to get connection string info
 Unless you buy an IPV4 add-on you need to use the session pooler version of the connection string,
 or you'll get `nodename nor servname provided, or not known`. Ref: https://github.com/orgs/supabase/discussions/33534
 
-If so, don't forget to include the tenant ID (e.g. `[USER].hjdsfghjfbdhsk`; teh part after the dot) or you'll get InternalServerError: Tenant or user not found
+If so, don't forget to include the tenant ID (e.g. `[USER].hjdsfghjfbdhsk`; the part after the dot) or you'll get InternalServerError: Tenant or user not found
 
 It's probably a good idea to have an app-level user, in order to assert least privilege.
 

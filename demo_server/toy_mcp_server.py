@@ -35,7 +35,7 @@ mcp = FastMCP(
     name=TOY_SERVER_NAME,
     version=TOY_SERVER_VERSION,
     description=TOY_SERVER_DESCRIPTION,
-    context={}, # No shared context needed for these tools
+    context={},  # No shared context needed for these tools
     auto_mount=False,
     auth_backend=None
 )
@@ -146,7 +146,7 @@ if __name__ == '__main__':
     logger.info('For standard execution, use:')
     logger.info(f'uvicorn toy_server:create_app --factory --host 127.0.0.1 --port {DEFAULT_PORT}')
     uvicorn.run(
-        'toy_server:create_app', # Factory function string
+        'toy_server:create_app',  # Factory function string
         host='127.0.0.1',
         port=DEFAULT_PORT,
         factory=True,

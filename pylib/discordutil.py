@@ -40,7 +40,7 @@ async def send_long_message(sendable: commands.Context | discord.Interaction | d
     start = 0
     # Ensure content is a string, even if it's None or another type unexpectedly
     content_str = str(content) if content is not None else ''
-    if not content_str.strip(): # Don't try to send empty messages
+    if not content_str.strip():  # Don't try to send empty messages
         logger.debug('Attempted to send empty message.')
         return
 
@@ -66,7 +66,7 @@ async def send_long_message(sendable: commands.Context | discord.Interaction | d
                             logger.debug('Sent initial interaction response (unexpected path after deferral).')
                         except discord.InteractionResponded:
                             logger.warning('Interaction already responded, but followup wasn\'t triggered correctly. Sending via followup.')
-                            await sendable.followup.send(chunk, ephemeral=send_ephemeral) # Fallback to followup
+                            await sendable.followup.send(chunk, ephemeral=send_ephemeral)  # Fallback to followup
                     else:
                         await sendable.followup.send(chunk, ephemeral=send_ephemeral)
                 else:
@@ -90,15 +90,15 @@ async def send_long_message(sendable: commands.Context | discord.Interaction | d
                         await sendable.followup.send(error_msg, ephemeral=True)
                     else:
                         # Avoid double-responding if initial send failed
-                        pass # await sendable.response.send_message(error_msg, ephemeral=True) # Risky if initial failed
-                # else: await sendable.send(error_msg) # Avoid sending public errors if interaction failed
+                        pass  # await sendable.response.send_message(error_msg, ephemeral=True)  # Risky if initial failed
+                # else: await sendable.send(error_msg)  # Avoid sending public errors if interaction failed
             except Exception:
-                pass # Avoid error loops
-            break # Stop sending further chunks on error
+                pass  # Avoid error loops
+            break  # Stop sending further chunks on error
 
         start = end
         first_chunk = False
-        if start < len(content_str): # Only sleep if more chunks are coming
+        if start < len(content_str):  # Only sleep if more chunks are coming
             await asyncio.sleep(0.2)
 
 
@@ -128,7 +128,7 @@ async def handle_attachments(attachments: list[discord.Attachment], message) -> 
             #     content_bytes = await attachment.read()
             #     # Attempt decoding, fall back to representing as bytes if fails
             #     try:
-            #         content = content_bytes.decode('utf-8') # Or try other common encodings
+            #         content = content_bytes.decode('utf-8')  # Or try other common encodings
             #     except UnicodeDecodeError:
             #         logger.warning(f'Could not decode attachment {attachment.filename} as UTF-8.', attachment_id=attachment.id)
             #         content = f'[Binary content of {attachment.filename}]'
@@ -142,7 +142,7 @@ async def handle_attachments(attachments: list[discord.Attachment], message) -> 
                     content_bytes = await attachment.read()
                     content = content_bytes.decode('utf-8')
                     # Optional: Truncate large files
-                    max_len = 5000 # Example limit
+                    max_len = 5000  # Example limit
                     if len(content) > max_len:
                         content = content[:max_len] + '\n[... content truncated ...]'
                 except UnicodeDecodeError:

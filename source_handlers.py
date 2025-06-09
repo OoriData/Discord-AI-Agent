@@ -14,7 +14,7 @@ try:
     FEEDPARSER_AVAILABLE = True
 except ImportError:
     FEEDPARSER_AVAILABLE = False
-    feedparser = None # Define feedparser as None if not available
+    feedparser = None  # Define feedparser as None if not available
 
 # from b4a_config import B4AConfig, B4AConfigError, MCPConfig, MCPConfigError, RSSConfig
 
@@ -23,12 +23,12 @@ logger = structlog.get_logger(__name__)
 # Simple in-memory cache for RSS feeds (URL -> (timestamp, feed_data))
 # Managed within the cog instance that uses this function
 # _rss_feed_cache = {}
-# _rss_cache_ttl = 300 # Cache feeds for 5 minutes (300 seconds)
+# _rss_cache_ttl = 300  # Cache feeds for 5 minutes (300 seconds)
 
 async def fetch_and_parse_rss(
     url: str,
-    cache: dict[str, tuple[float, Any]], # Pass cache dict from cog
-    cache_ttl: int # Pass TTL from cog
+    cache: dict[str, tuple[float, Any]],  # Pass cache dict from cog
+    cache_ttl: int  # Pass TTL from cog
 ) -> tuple[Any | None, str | None]:
     '''
     Fetches and parses an RSS feed URL with simple time-based caching.
@@ -53,14 +53,14 @@ async def fetch_and_parse_rss(
         timestamp, cached_feed = cache[url]
         if current_time - timestamp < cache_ttl:
             logger.debug('Returning cached RSS feed', url=url)
-            return cached_feed, None # Return cached data, no error
+            return cached_feed, None  # Return cached data, no error
 
     # Fetch feed with httpx
     logger.debug('Fetching RSS feed', url=url)
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
             response = await client.get(url)
-            response.raise_for_status() # Raise HTTPStatusError for bad responses (4xx or 5xx)
+            response.raise_for_status()  # Raise HTTPStatusError for bad responses (4xx or 5xx)
     except httpx.TimeoutException:
         logger.warning('Timeout fetching RSS feed', url=url)
         return None, f'Timeout trying to fetch the RSS feed from {url}.'
@@ -94,7 +94,7 @@ async def fetch_and_parse_rss(
 
         # Update cache
         cache[url] = (current_time, parsed_feed)
-        return parsed_feed, None # Return parsed data, no error
+        return parsed_feed, None  # Return parsed data, no error
 
     except Exception as e:
         logger.exception('Unexpected error during RSS feed parsing', url=url)

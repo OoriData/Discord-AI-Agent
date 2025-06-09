@@ -10,7 +10,7 @@ from ogbujipt.embedding.pgvector import MessageDB
 emodel = SentenceTransformer('all-MiniLM-L6-v2')
 
 su_conn_str = os.environ.get('AIBOT_PG_SUPERUSER_CONNECT_STRING')
-# user_conn_str = os.environ.get('AIBOT_PG_CONNECT_STRING')
+user_conn_str = os.environ.get('AIBOT_PG_USER_CONNECT_STRING')
 username = os.environ.get('AIBOT_PG_USER')
 password = os.environ.get('AIBOT_PG_USER_PASSWORD')
 tname = os.environ.get('AIBOT_PG_TABLE_NAME', 'discord_chat_history')

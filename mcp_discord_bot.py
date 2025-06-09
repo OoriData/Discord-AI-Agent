@@ -68,7 +68,7 @@ def setup_logging(classic_tracebacks: bool = False, log_level_str: str = 'INFO')
         # Use initial logger config which might still be INFO level before this point
         logging.warning(f"Invalid log level '{log_level_str}' provided. Defaulting to INFO.")
         numeric_level = logging.INFO
-        log_level_str = 'INFO' # Ensure we log the level actually being set
+        log_level_str = 'INFO'  # Ensure we log the level actually being set
 
     # Log the level being set *before* actually setting it on the root logger
     # This message will appear if the *current* level allows INFO messages.
@@ -108,7 +108,7 @@ def load_main_config(config_path: Path) -> dict[str, Any]:
     config['llm_endpoint'].setdefault('base_url', 'http://localhost:1234/v1')
     if 'api_key' not in config['llm_endpoint']:
          # Resolve directly here or let b4a_config handle env vars? Let b4a handle $VAR style.
-         config['llm_endpoint']['api_key'] = os.environ.get('OPENAI_API_KEY', 'lm-studio') # Keep default/env fallback
+         config['llm_endpoint']['api_key'] = os.environ.get('OPENAI_API_KEY', 'lm-studio')  # Keep default/env fallback
          logger.info('Using default or environment variable for LLM API key.', key_source='env/default' if config['llm_endpoint']['api_key'] == 'lm-studio' else 'config/env')
 
     # Validate/Default Model Params
@@ -131,12 +131,12 @@ def main(
 
     # Priority: CLI > Environment Variable > Default
     env_loglevel = os.environ.get('AIBOT_LOGLEVEL')
-    effective_loglevel = loglevel # Start with CLI arg (or its default 'INFO')
+    effective_loglevel = loglevel  # Start with CLI arg (or its default 'INFO')
 
     log_source = "default"
-    if loglevel != 'INFO': # CLI was explicitly set to something other than default
+    if loglevel != 'INFO':  # CLI was explicitly set to something other than default
         log_source = "CLI argument (--loglevel)"
-    elif env_loglevel: # CLI was default ('INFO'), but ENV var is set
+    elif env_loglevel:  # CLI was default ('INFO'), but ENV var is set
         effective_loglevel = env_loglevel
         log_source = "environment variable (AIBOT_LOGLEVEL)"
 
@@ -192,7 +192,7 @@ def main(
     # Check environment variables for PGVector settings
     pgvector_enabled = os.environ.get('AIBOT_PGVECTOR_HISTORY_ENABLED', 'false').lower() == 'true'
     pgvector_config = None
-    embedding_model = None # Add this line
+    embedding_model = None  # Add this line
 
     if pgvector_enabled:
         logger.info('PGVector history is ENABLED via environment variable.')
@@ -205,7 +205,7 @@ def main(
 
             pgvector_config = {
                 'enabled': True,
-                'embedding_model': embedding_model, # Pass the loaded model object
+                'embedding_model': embedding_model,  # Pass the loaded model object
                 'conn_str': os.environ.get('AIBOT_PG_CONNECT_STRING'),
                 'table_name': os.environ.get('AIBOT_PG_TABLE_NAME', 'discord_chat_history'),
                 'db_name': os.environ.get('AIBOT_PG_DB_NAME'),
@@ -220,7 +220,7 @@ def main(
                 missing_vars = [var for var in required_pg_vars if not os.environ.get(var)]
                 if missing_vars:
                     logger.error(f'PGVector enabled, but missing required environment variables: {missing_vars}. Disabling.')
-                    pgvector_config['enabled'] = False # Disable if config is incomplete
+                    pgvector_config['enabled'] = False  # Disable if config is incomplete
                     pgvector_enabled = False
 
         except ImportError:
@@ -271,10 +271,10 @@ def main(
     try:
         # Convert the effective level string back to a logging constant for discord.py
         discord_log_level = getattr(logging, effective_loglevel_upper, logging.INFO)
-        if not isinstance(discord_log_level, int): # Safety check
+        if not isinstance(discord_log_level, int):  # Safety check
             discord_log_level = logging.INFO
 
-        bot.run(discord_token, log_handler=None, log_level=discord_log_level) # Use dynamic level
+        bot.run(discord_token, log_handler=None, log_level=discord_log_level)  # Use dynamic level
     except discord.LoginFailure:
         logger.critical('Login failed: Invalid Discord token.')
     except discord.PrivilegedIntentsRequired:

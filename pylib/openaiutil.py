@@ -25,7 +25,7 @@ def replace_system_prompt(messages, sysprommpt):
 def extract_tool_calls_from_content(content: str) -> tuple[list[dict], str]:
     ''' Extracts tool calls from the content string. '''
     import re
-    import json # Ensure json is imported
+    import json  # Ensure json is imported
 
     parsed_tool_calls = []
     # Basic regex to find the JSON within the tags (adjust if needed)
@@ -39,7 +39,7 @@ def extract_tool_calls_from_content(content: str) -> tuple[list[dict], str]:
             if 'name' in tool_data and 'arguments' in tool_data:
                  parsed_tool_calls.append({
                      'id': tool_call_id,
-                     'type': 'function', # Assume function
+                     'type': 'function',  # Assume function
                      'function': {
                          'name': tool_data['name'],
                          # Ensure arguments are stringified if needed by later code
@@ -59,7 +59,7 @@ def extract_tool_calls_from_content(content: str) -> tuple[list[dict], str]:
         updated_content = re.sub(r'<tool_call>.*?</tool_call>', '', content, flags=re.DOTALL).strip()
         logger.info(f'Proceeding with {len(parsed_tool_calls)} tool calls parsed from text.')
         return parsed_tool_calls, updated_content
-    return [], content # Return empty list and original content if no calls found/parsed
+    return [], content  # Return empty list and original content if no calls found/parsed
 
 
 def format_calltoolresult_content(result: ToolInvocationResult | dict[str, str]) -> str:
@@ -75,7 +75,7 @@ def format_calltoolresult_content(result: ToolInvocationResult | dict[str, str])
         if content is None:
                 # Assume tool_name attribute exists on ToolInvocationResult based on library structure
                 tool_name_attr = getattr(result, 'tool_name', 'unknown_tool')
-                logger.warning('MCP ToolInvocationResult received with None content.', tool_name=tool_name_attr, error_code=result.error_code) # Assuming tool_name exists
+                logger.warning('MCP ToolInvocationResult received with None content.', tool_name=tool_name_attr, error_code=result.error_code)  # Assuming tool_name exists
                 return 'Tool executed successfully but returned no content.'
 
         if isinstance(content, dict) and content.get('type') == 'text' and 'text' in content:
@@ -92,7 +92,7 @@ def format_calltoolresult_content(result: ToolInvocationResult | dict[str, str])
                 return json.dumps(content, indent=2)
             except TypeError as json_err:
                 logger.warning('Could not JSON serialize MCP tool result content.', content_type=type(content), error=str(json_err))
-                return str(content) # Fallback
+                return str(content)  # Fallback
         else:
             logger.warning('Unexpected type for MCP ToolInvocationResult content.', content_type=type(content))
             return str(content)
@@ -100,9 +100,9 @@ def format_calltoolresult_content(result: ToolInvocationResult | dict[str, str])
     elif isinstance(result, dict):
         # Handle RSS result or any error dict
         if 'result' in result:
-            return str(result['result']) # Return the formatted RSS result string
+            return str(result['result'])  # Return the formatted RSS result string
         elif 'error' in result:
-            return f'Tool Error: {result['error']}' # Return formatted error
+            return f'Tool Error: {result['error']}'  # Return formatted error
         else:
             # Gracefully handle unexpected dict format
             logger.warning('Unexpected dict format received in format_calltoolresult_content', received_result=result)
@@ -188,7 +188,7 @@ class OpenAILLMWrapper:
                                 if chunk_func.name: tc_ref['function']['name'] += chunk_func.name
                                 if chunk_func.arguments: tc_ref['function']['arguments'] += chunk_func.arguments
                 tool_calls_aggregated = [tc for tc in current_tool_calls if tc.get('id') and tc['function'].get('name')]
-            else: # Non-Streaming
+            else:  # Non-Streaming
                 response = await self.llm_client.chat.completions.create(messages=messages, user=user, **chat_params)
                 # response = await self.llm_client.chat.completions.create(messages=messages, **chat_params)
                 response_message: ChatCompletionMessage | None = response.choices[0].message if response.choices else None
@@ -229,7 +229,7 @@ class OpenAILLMWrapper:
                 tool_name = tool_call['function']['name']
                 tool_call_id = tool_call['id']
                 arguments_str = tool_call['function']['arguments']
-                tool_result_content_formatted = f'Error: Tool call processing failed internally before execution for {tool_name}' # Default
+                tool_result_content_formatted = f'Error: Tool call processing failed internally before execution for {tool_name}'  # Default
                 tool_call_exc = None
             except Exception as exc:
                 # Catch errors from execute_tool or format_calltoolresult_content itself (should be rare now)
@@ -291,7 +291,7 @@ class OpenAILLMWrapper:
 
             logger.debug('Initiating follow-up LLM call after tools.', thread_id=thread_id)
             follow_up_params = {**self.llm_chat_params, 'stream': stream}
-            follow_up_params.pop('tools', None) # No tools needed for follow-up
+            follow_up_params.pop('tools', None)  # No tools needed for follow-up
             follow_up_params.pop('tool_choice', None)
 
             follow_up_text = ''
@@ -307,7 +307,7 @@ class OpenAILLMWrapper:
                     follow_up_message = follow_up_response.choices[0].message if follow_up_response.choices else None
                     if follow_up_message: follow_up_text = follow_up_message.content or ''
 
-            except OpenAIError as exc: # Catch specific OpenAI errors
+            except OpenAIError as exc:  # Catch specific OpenAI errors
                 raise MissingLLMResponseError(f'⚠️ Error communicating with AI during follow-up LLM call: {str(exc)}')
                 return
 

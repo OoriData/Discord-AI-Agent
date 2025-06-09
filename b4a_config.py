@@ -50,7 +50,7 @@ def resolve_value(value: Any) -> Any:
             env_value = os.environ.get(var_name)
             if env_value is None:
                 logger.warning(f'Environment variable `{var_name}` requested in config not found.', requested_var=var_name)
-                return None # Or raise error, or return the pattern? Returning None for now.
+                return None  # Or raise error, or return the pattern? Returning None for now.
             logger.debug(f'Resolved environment variable `{var_name}`.')
             return env_value
     # Recursively resolve in lists and dicts if needed in future
@@ -69,7 +69,7 @@ class B4ALoader:
         self.rss_sources: list[RSSConfig] = []
         # Add lists for other source types as handlers are implemented
         self.unhandled_sources: list[dict[str, Any]] = []
-        self.load_errors: list[tuple[str, str]] = [] # (filepath, error_message)
+        self.load_errors: list[tuple[str, str]] = []  # (filepath, error_message)
 
     def load_and_process_sources(self, main_config: dict[str, Any], config_dir: str):
         '''
@@ -88,11 +88,11 @@ class B4ALoader:
 
         if not isinstance(source_files_relative, list):
             logger.error('Main config `[b4a].source_sets` is not a list. Cannot load B4A sources.', config_sources=source_files_relative)
-            return # Cannot proceed
+            return  # Cannot proceed
 
         if not source_files_relative:
             logger.info('No B4A sources listed in `[b4a].source_sets`.')
-            return # Nothing to load
+            return  # Nothing to load
 
         logger.info(f'Found {len(source_files_relative)} B4A source files listed.', sources=source_files_relative)
 
@@ -120,7 +120,7 @@ class B4ALoader:
                 continue
             except Exception as e:
                 err_msg = f'Unexpected error loading B4A source file: {abs_path} - {e}'
-                logger.exception(err_msg, filepath=abs_path) # Use exception for full trace
+                logger.exception(err_msg, filepath=abs_path)  # Use exception for full trace
                 self.load_errors.append((abs_path, err_msg))
                 continue
 
@@ -142,7 +142,7 @@ class B4ALoader:
 
         if not source_type or not isinstance(source_type, str):
             err_msg = f'B4A source file missing or invalid `type` field.'
-            logger.error(err_msg, filepath=filepath, config_preview=dict(list(config.items())[:3])) # Log first few items
+            logger.error(err_msg, filepath=filepath, config_preview=dict(list(config.items())[:3]))  # Log first few items
             self.load_errors.append((filepath, err_msg))
             return
 
@@ -159,7 +159,7 @@ class B4ALoader:
         # Add elif for other types like .openapi, .file, etc.
         else:
             logger.warning(f'No handler found for B4A source type `{source_type}`. Storing as unhandled.', name=source_name, type=source_type, filepath=filepath)
-            self.unhandled_sources.append({**resolved_config, '_filepath': filepath, '_sourcename': source_name}) # Store with context
+            self.unhandled_sources.append({**resolved_config, '_filepath': filepath, '_sourcename': source_name})  # Store with context
 
     # Type-specific handlers
 
@@ -168,8 +168,8 @@ class B4ALoader:
         logger.debug('Handling .mcp source.', name=name, filepath=filepath)
         mcp_url = config.get('url')
         # Example: Add connection_method, auth handling later based on spec details
-        # connection_method = config.get('connection_method', 'default') # e.g., http_sse, grpc?
-        # auth_config = config.get('auth', {}) # e.g., {'type': 'token', 'token': '$MCP_TOKEN'}
+        # connection_method = config.get('connection_method', 'default')  # e.g., http_sse, grpc?
+        # auth_config = config.get('auth', {})  # e.g., {'type': 'token', 'token': '$MCP_TOKEN'}
 
         if not mcp_url or not isinstance(mcp_url, str):
             err_msg = f'`@mcp` source `{name}` is missing required `url` field or it\'s not a string.'
