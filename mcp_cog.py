@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # mcp_cog.py
 '''
-Discord cog for MCP integration using mcp-sse-client. Connects to MCP servers
-and provides commands to interact with MCP tools via an LLM.
+Discord cog for MCP integration using the official MCP Python SDK with Streamable HTTP transport.
+Connects to MCP servers and provides commands to interact with MCP tools via an LLM.
 '''
 import os
 import json
@@ -24,7 +24,14 @@ import structlog  # type: ignore
 # Openai types might be useful for clarity
 from ogbujipt.embedding.pgvector import MessageDB
 
-from mcp_sse_client import MCPClient, ToolDef, ToolInvocationResult, ToolParameter
+# Official MCP SDK imports
+from mcp.client.session_group import ClientSessionGroup, StreamableHttpParameters
+from mcp.types import Tool, ListToolsResult
+from mcp import McpError
+
+# Tenacity for retry logic
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 from b4a_config import B4ALoader, MCPConfig, resolve_value
 from source_handlers import FEEDPARSER_AVAILABLE
 
@@ -104,8 +111,8 @@ class MCPCog(commands.Cog, RSSAgent):
         RSSAgent.__init__(self, b4a_data, {}, 0)  # Initialize RSSAgent with empty cache
         self.bot = bot
         self.config = config  # Agent config (LLM, etc.)
-        self.mcp_connections: dict[str, MCPClient] = {}  # Keyed by MCPConfig.name
-        self.mcp_tools: dict[str, List[ToolDef]] = {}  # Keyed by MCPConfig.name
+        self.mcp_connections: dict[str, StreamableHttpParameters] = {}  # Keyed by MCPConfig.name
+        self.mcp_tools: dict[str, list[Tool]] = {}  # Keyed by MCPConfig.name
         self.message_history: dict[int, list[dict[str, Any]]] = {}
 
         self._connection_tasks: dict[str, asyncio.Task] = {}
@@ -167,8 +174,13 @@ class MCPCog(commands.Cog, RSSAgent):
             pgvector_enabled=self.pgvector_enabled,
             rss_handler_available=FEEDPARSER_AVAILABLE)
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((ConnectionError, McpError))
+    )
     async def _manage_mcp_connection(self, mcp_config: MCPConfig):
-        '''Persistent task to manage a single MCP connection using MCPClient.'''
+        '''Persistent task to manage a single MCP connection using the official MCP SDK.'''
         url = mcp_config.url
         name = mcp_config.name  # Use the name from B4A config
         reconnect_delay = 15  # Initial delay seconds
@@ -176,51 +188,67 @@ class MCPCog(commands.Cog, RSSAgent):
 
         while not self._shutdown_event.is_set():
             logger.info(f'Attempting connection for MCP source: \'{name}\'', url=url)
-            client: MCPClient | None = None
+            session_group: ClientSessionGroup | None = None
             try:
-                # TODO: Add auth handling here based on mcp_config fields if needed
-                client = MCPClient(url)
-                logger.info(f'MCPClient instance created for \'{name}\'. listing tools…')
-
-                # list Tools acts as connection check & fetches tool info
-                # Will likely handle the underlying SSE connection setup and MCP handshake implicitly
-                # Add timeout? Check whether MCPClient handles that, but add ours, for now
-                tools_list: list[ToolDef] = await asyncio.wait_for(client.list_tools(), timeout=45.0)
-
-                self.mcp_connections[name] = client
+                # Create session group for this MCP server
+                session_group = ClientSessionGroup()
+                
+                # Create connection parameters
+                connection_params = StreamableHttpParameters(
+                    url=url,
+                    timeout=45.0,  # 45 second timeout
+                    sse_read_timeout=30.0,  # 30 second SSE read timeout
+                    terminate_on_close=True
+                )
+                
+                logger.info(f'Connecting to MCP source \'{name}\'...')
+                
+                # Connect to the server
+                session = await session_group.connect_to_server(connection_params)
+                
+                # Initialize the session
+                await session.initialize()
+                
+                # List tools to verify connection and get tool definitions
+                tools_result = await session.list_tools()
+                tools_list = tools_result.tools if tools_result else []
+                
+                # Store the session group and tools
+                self.mcp_connections[name] = session_group
                 self.mcp_tools[name] = tools_list
+                
                 logger.info(f'Connected to MCP source \'{name}\' and listed {len(tools_list)} tools.', server_name=name)
                 reconnect_delay = 15  # Reset delay on success
 
-                # Connection Maintenance (MCPClient handles underlying keep-alive/SSE)
-                # Just need to wait until shutdown or an error occurs during a tool call.
-                # Task can potentially sleep or periodically check status if MCPClient provides a method.
-                # For now, rely on execute_tool to detect issues. Wait for shutdown signal.
+                # Wait for shutdown signal
                 await self._shutdown_event.wait()
                 logger.info(f'Shutdown signal received for {name}. Ending management task.')
-                # Loop will terminate because _shutdown_event is set.
+                break
 
-            except (ConnectError, ReadTimeout, ConnectionRefusedError) as conn_err:
-                 logger.warning(f'Connection failed for MCP server {name}: {type(conn_err).__name__}. Retrying…', server_name=name, error=str(conn_err))
+            except McpError as mcp_err:
+                logger.warning(f'MCP error for server {name}: {type(mcp_err).__name__}. Retrying…', server_name=name, error=str(mcp_err))
+            except ConnectionError as conn_err:
+                logger.warning(f'Connection failed for MCP server {name}: {type(conn_err).__name__}. Retrying…', server_name=name, error=str(conn_err))
             except asyncio.TimeoutError:
                 logger.error(f'Timeout connecting or listing tools for MCP server {name}. Retrying…', server_name=name)
             except asyncio.CancelledError:
                 logger.info(f'Connection task for {name} cancelled.')
                 break  # Exit loop immediately
             except Exception as e:
-                # Catch other errors from MCPClient init or list_tools
+                # Catch other errors from MCP SDK
                 logger.exception(f'Unexpected error managing connection for {name}. Retrying…', server_name=name, url=url)
-                # Optionally log traceback: logger.error('Traceback:', exc_info=True)
 
             # Cleanup before Reconnect/Shutdown
             logger.debug(f'Cleaning up resources for {name} before retry/shutdown.')
             if name in self.mcp_connections:
-                # Does MCPClient need explicit closing? Check its implementation.
-                # Assuming no explicit close needed for now, just remove reference.
+                try:
+                    await self.mcp_connections[name].disconnect_from_server(name)
+                except Exception as cleanup_err:
+                    logger.warning(f'Error during cleanup for {name}: {cleanup_err}')
                 del self.mcp_connections[name]
             if name in self.mcp_tools:
                 del self.mcp_tools[name]
-            client = None  # Ensure client object is cleared
+            session_group = None
 
             # Wait before Retrying (if not shutting down)
             if not self._shutdown_event.is_set():
@@ -237,9 +265,15 @@ class MCPCog(commands.Cog, RSSAgent):
 
         # Final Task Cleanup (on shutdown or cancellation)
         logger.info(f'Connection management task for {name} finished cleanly.')
-        if name in self.mcp_connections: del self.mcp_connections[name]
-        if name in self.mcp_tools: del self.mcp_tools[name]
-        client = None
+        if name in self.mcp_connections: 
+            try:
+                await self.mcp_connections[name].disconnect_from_server(name)
+            except Exception:
+                pass  # Ignore cleanup errors during shutdown
+            del self.mcp_connections[name]
+        if name in self.mcp_tools: 
+            del self.mcp_tools[name]
+        session_group = None
 
     async def cog_load(self):
         '''
@@ -342,6 +376,14 @@ class MCPCog(commands.Cog, RSSAgent):
         else:
              logger.info('No active connection tasks to stop.')
 
+        # Clean up session groups
+        for server_name, session_group in list(self.mcp_connections.items()):
+            try:
+                await session_group.disconnect_from_server(server_name)
+                logger.debug(f'Disconnected from MCP server: {server_name}')
+            except Exception as e:
+                logger.warning(f'Error disconnecting from MCP server {server_name}: {e}')
+
         # Clear stored data regardless of task shutdown status
         self.mcp_connections.clear()
         self.mcp_tools.clear()
@@ -413,10 +455,10 @@ class MCPCog(commands.Cog, RSSAgent):
         # Actually let replace_system_prompt take care of sysprompts
         return self.message_history[channel_id]
 
-    async def execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> ToolInvocationResult | dict[str, str]:
+    async def execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any] | dict[str, str]:
         '''
         Execute an MCP tool or the RSS query tool.
-        Returns ToolInvocationResult for MCP tools, or a dict for RSS/errors.
+        Returns a dict with tool results or error information.
         '''
         logger.debug('Executing tool', tool_name=tool_name, tool_input=tool_input)
 
@@ -425,19 +467,19 @@ class MCPCog(commands.Cog, RSSAgent):
                 return {'error': 'RSS querying is disabled because the `feedparser` library is not installed.'}
             return await self.execute_rss_query(tool_input)
 
-        mcp_client: MCPClient | None = None
+        session_group: ClientSessionGroup | None = None
         server_name_found: str | None = None  # B4A source name
 
-        # Find the server/client (keyed by B4A source name) that has the tool
-        for source_name, client in self.mcp_connections.items():
+        # Find the server/session group (keyed by B4A source name) that has the tool
+        for source_name, session_grp in self.mcp_connections.items():
             # Check if the tool name exists in the list of tools for this server
             if source_name in self.mcp_tools and any(tool.name == tool_name for tool in self.mcp_tools[source_name]):
-                mcp_client = client
+                session_group = session_grp
                 server_name_found = source_name
-                logger.debug(f'Found active client for tool `{tool_name}` on MCP source \'{server_name_found}\'.')
+                logger.debug(f'Found active session group for tool `{tool_name}` on MCP source \'{server_name_found}\'.')
                 break
 
-        if not mcp_client or not server_name_found:
+        if not session_group or not server_name_found:
             logger.warning(f'MCP Tool `{tool_name}` not found on any *actively connected* MCP source.')
             # Provide more specific error based on B4A data
             if not self.b4a_data.mcp_sources:
@@ -452,38 +494,49 @@ class MCPCog(commands.Cog, RSSAgent):
 
         logger.info(f'Calling MCP tool `{tool_name}` on MCP server `{server_name_found}`')
         try:
-            # Call the tool using MCPClient's invoke_tool method
-            # Add a timeout for the specific tool call.
-            result: ToolInvocationResult = await asyncio.wait_for(
-                mcp_client.invoke_tool(tool_name, tool_input),
+            # Call the tool using the session group's call_tool method
+            result = await asyncio.wait_for(
+                session_group.call_tool(tool_name, tool_input),
                 timeout=120.0  # FIXME: Make configurable
             )
-            logger.debug(f'Tool `{tool_name}` executed via MCPClient.', result_content=result.content, error_code=result.error_code)
-
-            # Check for tool-specific errors reported by MCPClient/Server
-            # Check specifically for non-zero error codes. Treat None and 0 as success.
-            if result.error_code is not None and result.error_code != 0:
-                logger.warning(f'Tool `{tool_name}` executed but reported an error.', error_code=result.error_code, content=result.content)
-                # Format the error content for the user/LLM
-                error_message = f'Tool reported error code {result.error_code}'
-                if result.content:  # Include content if provided with the error
-                     error_message += f': {str(result.content)}'
-                return {'error': error_message}  # Return standard error dict
-
-            # If error_code is None or 0, it's a success
-            return result  # Return the successful ToolInvocationResult object
+            
+            logger.debug(f'Tool `{tool_name}` executed via MCP SDK.', result_content=result.content)
+            
+            # The result should be a dict with the tool's response
+            if isinstance(result, dict):
+                return result
+            else:
+                # Convert other result types to dict format
+                return {'content': str(result)}
 
         except asyncio.TimeoutError:
              logger.error(f'Timeout calling MCP tool `{tool_name}` on server `{server_name_found}`', tool_input=tool_input)
-             # Attempt to trigger reconnect by removing client? Or let manager handle?
-             # Let manager handle based on future failures.
              return {'error': f'Tool call `{tool_name}` timed out.'}
-        except (ConnectError, ReadTimeout, BrokenResourceError, ClosedResourceError, ConnectionError, WouldBlock) as conn_err:
+        except McpError as mcp_err:
+            # Catch MCP-specific errors
+            logger.error(f'MCP error during tool call `{tool_name}` on server `{server_name_found}`: {type(mcp_err).__name__}', tool_input=tool_input, error=str(mcp_err))
+            # Remove the session group reference; the management task will handle reconnection.
+            if server_name_found in self.mcp_connections: 
+                try:
+                    await self.mcp_connections[server_name_found].disconnect_from_server(server_name_found)
+                except Exception:
+                    pass
+                del self.mcp_connections[server_name_found]
+            if server_name_found in self.mcp_tools: 
+                del self.mcp_tools[server_name_found]
+            return {'error': f'MCP error executing tool `{tool_name}`: {str(mcp_err)}'}
+        except ConnectionError as conn_err:
             # Catch connection-related errors during the tool call
             logger.error(f'Connection error during MCP tool call `{tool_name}` on server `{server_name_found}`: {type(conn_err).__name__}', tool_input=tool_input, error=str(conn_err))
-            # Remove the client reference; the management task will handle reconnection.
-            if server_name_found in self.mcp_connections: del self.mcp_connections[server_name_found]
-            if server_name_found in self.mcp_tools: del self.mcp_tools[server_name_found]  # Also clear tools
+            # Remove the session group reference; the management task will handle reconnection.
+            if server_name_found in self.mcp_connections: 
+                try:
+                    await self.mcp_connections[server_name_found].disconnect_from_server(server_name_found)
+                except Exception:
+                    pass
+                del self.mcp_connections[server_name_found]
+            if server_name_found in self.mcp_tools: 
+                del self.mcp_tools[server_name_found]
             return {'error': f'Connection error executing MCP tool `{tool_name}`. The server may be temporarily unavailable. Please try again.'}
         except Exception as e:
             logger.exception(f'Unexpected error calling tool `{tool_name}` on server `{server_name_found}`', tool_input=tool_input)
@@ -491,15 +544,14 @@ class MCPCog(commands.Cog, RSSAgent):
 
     def _map_mcp_type_to_json_type(self, mcp_type: str) -> str:
         '''Maps MCP parameter types to JSON Schema types.'''
-        # Based on mcp-sse-client ToolParameter.parameter_type which seems to be string
+        # Based on the official MCP SDK's Tool.inputSchema structure
         type_map = {
             'string': 'string',
             'integer': 'integer',
             'number': 'number',
             'boolean': 'boolean',
-            'array': 'array',  # Assuming direct mapping for array/object might need refinement
+            'array': 'array',
             'object': 'object',
-            # Add other mappings if MCP uses different type names
         }
         json_type = type_map.get(mcp_type.lower(), 'string')  # Default to string if unknown
         if json_type != mcp_type.lower():
@@ -518,55 +570,47 @@ class MCPCog(commands.Cog, RSSAgent):
                 logger.warning(f'Server `{server_name}` is connected but has no tools listed. Skipping for OpenAI format.', server_name=server_name)
                 continue
 
-            tool_defs: list[ToolDef] = self.mcp_tools[server_name]
+            tool_defs: list[Tool] = self.mcp_tools[server_name]
             logger.debug(f'Formatting {len(tool_defs)} MCP tools from active server `{server_name}` for OpenAI.')
 
             for tool in tool_defs:
-                # Validate ToolDef structure (basic check)
-                if not isinstance(tool, ToolDef) or not hasattr(tool, 'name') or not tool.name:
-                    logger.warning(f'Skipping malformed/nameless ToolDef from server `{server_name}`', tool_data=tool)
+                # Validate Tool structure (basic check)
+                if not isinstance(tool, Tool) or not hasattr(tool, 'name') or not tool.name:
+                    logger.warning(f'Skipping malformed/nameless Tool from server `{server_name}`', tool_data=tool)
                     continue
 
-                # Build JSON schema for parameters
+                # Build JSON schema for parameters from tool.inputSchema
                 properties = {}
                 required_params = []
-                if isinstance(tool.parameters, list):
-                    for param in tool.parameters:
-                        if not isinstance(param, ToolParameter) or not hasattr(param, 'name') or not param.name:
-                            logger.warning(f'Skipping malformed parameter in tool `{tool.name}`', param_data=param)
-                            continue
+                
+                if tool.inputSchema and hasattr(tool.inputSchema, 'properties'):
+                    schema_props = tool.inputSchema.properties
+                    if hasattr(schema_props, 'items'):
+                        # Handle array-like properties
+                        for prop_name, prop_schema in schema_props.items():
+                            param_schema = {
+                                'type': self._map_mcp_type_to_json_type(prop_schema.type if hasattr(prop_schema, 'type') else 'string'),
+                                'description': getattr(prop_schema, 'description', f'Parameter {prop_name}')
+                            }
+                            
+                            # Add enum if present
+                            if hasattr(prop_schema, 'enum') and prop_schema.enum:
+                                param_schema['enum'] = prop_schema.enum
 
-                        param_schema = {
-                            'type': self._map_mcp_type_to_json_type(param.parameter_type),
-                            'description': param.description or f'Parameter {param.name}'  # Add default desc
-                        }
-                        # Add enum if present (assuming param.enum is a list)
-                        if hasattr(param, 'enum') and isinstance(param.enum, list) and param.enum:
-                           param_schema['enum'] = param.enum
+                            # Add default if present
+                            if hasattr(prop_schema, 'default') and prop_schema.default is not None:
+                                param_schema['default'] = prop_schema.default
 
-                        # Add default if present (assuming param.default exists)
-                        if hasattr(param, 'default') and param.default is not None:
-                            param_schema['default'] = param.default
+                            properties[prop_name] = param_schema
 
-                        # Handle arrays (needs 'items' schema) - Basic handling
-                        if param_schema['type'] == 'array':
-                            # Default to array of strings if item type not specified
-                            # MCP ToolParameter needs more info for complex types
-                            param_schema['items'] = {'type': 'string'}
-                            logger.debug(f'Using default `items: string` for array param `{param.name}` in tool `{tool.name}`. Specify item type in MCP if needed.')
-
-                        # Handle objects (needs 'properties' schema) - Basic handling
-                        if param_schema['type'] == 'object':
-                            # Need more schema info from MCP ToolParameter for object properties
-                            param_schema['properties'] = {}
-                            logger.debug(f'Using default `properties: {{}}` for object param `{param.name}` in tool `{tool.name}`. Specify properties in MCP if needed.')
-
-
-                        properties[param.name] = param_schema
-
-                        # Check for required flag (assuming param.required is a boolean)
-                        if hasattr(param, 'required') and param.required:
-                            required_params.append(param.name)
+                            # Check for required flag
+                            if hasattr(prop_schema, 'required') and prop_schema.required:
+                                required_params.append(prop_name)
+                else:
+                    # Fallback: create a simple schema if inputSchema is not available
+                    logger.debug(f'Tool `{tool.name}` has no inputSchema, using fallback schema.')
+                    properties = {}
+                    required_params = []
 
                 # Final JSON Schema for the tool
                 parameters_schema = {
@@ -581,7 +625,7 @@ class MCPCog(commands.Cog, RSSAgent):
                     'type': 'function',
                     'function': {
                         'name': tool.name,
-                        'description': tool.description or f'Executes the {tool.name} tool.',  # Default desc
+                        'description': tool.description or f'Executes the {tool.name} tool.',
                         'parameters': parameters_schema,
                     },
                 }

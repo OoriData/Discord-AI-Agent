@@ -4,4 +4,4 @@ structlog
 asyncpg
 pgvector
 sentence_transformers
-git+https://github.com/zanetworker/mcp-sse-client-python.git
+tenacity

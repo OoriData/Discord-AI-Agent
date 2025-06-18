@@ -10,7 +10,6 @@ from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageToolCa
 from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceDelta
 
 import structlog
-from mcp_sse_client import ToolInvocationResult
 
 logger = structlog.get_logger(__name__)
 
@@ -62,52 +61,45 @@ def extract_tool_calls_from_content(content: str) -> tuple[list[dict], str]:
     return [], content  # Return empty list and original content if no calls found/parsed
 
 
-def format_calltoolresult_content(result: ToolInvocationResult | dict[str, str]) -> str:
+def format_calltoolresult_content(result: dict[str, Any] | dict[str, str]) -> str:
     '''
-    Extract content from a ToolInvocationResult object or format error dict.
+    Extract content from a tool result dict.
     Handles common MCP content structures like text content.
     '''
-    if isinstance(result, ToolInvocationResult):
-        # ToolInvocationResult has .content and .error_code
-        # We assume execute_tool already converted errors to the dict format.
-        # So, if we receive ToolInvocationResult here, it should be a success.
-        content = result.content
-        if content is None:
-                # Assume tool_name attribute exists on ToolInvocationResult based on library structure
-                tool_name_attr = getattr(result, 'tool_name', 'unknown_tool')
-                logger.warning('MCP ToolInvocationResult received with None content.', tool_name=tool_name_attr, error_code=result.error_code)  # Assuming tool_name exists
-                return 'Tool executed successfully but returned no content.'
-
-        if isinstance(content, dict) and content.get('type') == 'text' and 'text' in content:
-                text_content = content['text']
-                # Return the text directly, converting simple types to string
-                return str(text_content) if text_content is not None else ''
-
-        # Handle other types (simple types, lists, other dicts)
-        elif isinstance(content, (str, int, float, bool)):
-            return str(content)
-        elif isinstance(content, (dict, list)):
-            try:
-                # Nicely format other JSON-like structures
-                return json.dumps(content, indent=2)
-            except TypeError as json_err:
-                logger.warning('Could not JSON serialize MCP tool result content.', content_type=type(content), error=str(json_err))
-                return str(content)  # Fallback
-        else:
-            logger.warning('Unexpected type for MCP ToolInvocationResult content.', content_type=type(content))
-            return str(content)
-
-    elif isinstance(result, dict):
+    if isinstance(result, dict):
         # Handle RSS result or any error dict
         if 'result' in result:
             return str(result['result'])  # Return the formatted RSS result string
         elif 'error' in result:
             return f'Tool Error: {result['error']}'  # Return formatted error
+        elif 'content' in result:
+            content = result['content']
+            if content is None:
+                return 'Tool executed successfully but returned no content.'
+            
+            if isinstance(content, dict) and content.get('type') == 'text' and 'text' in content:
+                text_content = content['text']
+                # Return the text directly, converting simple types to string
+                return str(text_content) if text_content is not None else ''
+            elif isinstance(content, (str, int, float, bool)):
+                return str(content)
+            elif isinstance(content, (dict, list)):
+                try:
+                    # Nicely format other JSON-like structures
+                    return json.dumps(content, indent=2)
+                except TypeError as json_err:
+                    logger.warning('Could not JSON serialize MCP tool result content.', content_type=type(content), error=str(json_err))
+                    return str(content)  # Fallback
+            else:
+                logger.warning('Unexpected type for MCP tool result content.', content_type=type(content))
+                return str(content)
         else:
             # Gracefully handle unexpected dict format
             logger.warning('Unexpected dict format received in format_calltoolresult_content', received_result=result)
-            try: return json.dumps(result, indent=2)
-            except TypeError: return f'Unexpected tool result format: {str(result)[:200]}'
+            try: 
+                return json.dumps(result, indent=2)
+            except TypeError: 
+                return f'Unexpected tool result format: {str(result)[:200]}'
     else:
         # Gracefully handle unexpected types
         logger.warning('Unexpected format received in format_calltoolresult_content', received_result=result)
