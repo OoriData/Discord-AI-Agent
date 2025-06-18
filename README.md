@@ -69,7 +69,7 @@ python mcp_discord_bot.py # Reads from env vars
 
 ## PGVector chat history
 
-To enable persistent chat history storage using a PostgreSQL database with the PGVector extension, Ensure you have a running PostgreSQL database server with the [pgvector extension](https://github.com/pgvector/pgvector) available, then set up the environment variables. See below for nots on DB setup.
+To enable persistent chat history storage using a PostgreSQL database with the PGVector extension, Ensure you have a running PostgreSQL database server with the [pgvector extension](https://github.com/pgvector/pgvector) available, then set up the environment variables accordingly. See below for notes on DB setup.
 
 ### Additional Python dependencies:
 
@@ -92,9 +92,9 @@ Make sure it's in the `AIBOT_PG_USER_CONNECT_STRING` environment variable. If th
 Other environment variables:
 
 * **Required:**
-    * `AIBOT_PG_DB_NAME`: Name of the database to use.
-    * `AIBOT_PG_USER`:
-    * `AIBOT_PG_PASSWORD`:
+    * `AIBOT_PG_DB_NAME`: Name of the database to use
+    * `AIBOT_PG_USER`: Role name to use. It's a single-role authentication system
+    * `AIBOT_PG_PASSWORD`: Role's password
 * **Optional (Defaults Shown):**
     * `AIBOT_PG_HOST`: Database host (default: `localhost`)
     * `AIBOT_PG_PORT`: Database port (default: `5432`)
@@ -201,3 +201,13 @@ Note: [Supavisor does not support prepared statements in transaction mode. It do
 To make sure asyncpg doesn't cause probs with this
 
 > Disable automatic use of prepared statements by passing `statement_cache_size=0` to `asyncpg.connect()` and `asyncpg.create_pool()` (and, obviously, avoid the use of `Connection.prepare()`
+
+## Public schema warning
+
+Tables are in the `public` schema in Supabase, are automatically exposed via Supabase's auto-generated REST API. Without RLS enabled, any table in the public schema is accessible through the API to anyone who has this anon key, which is exposed in client-side code.
+
+If you do have your Supabase table in the `public` schema, we recommend you enable RLS on it, without creating any policies. That will blocks all public API access to the table, while the configured service role can bypass RLS. For example:
+
+```sql
+ALTER TABLE public.discord_chat_history ENABLE ROW LEVEL SECURITY;
+```

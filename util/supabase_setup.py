@@ -6,18 +6,13 @@ import asyncpg
 
 from sentence_transformers import SentenceTransformer
 from ogbujipt.embedding.pgvector import MessageDB
+from discord_aiagent import assemble_pgvector_config
 
-emodel = SentenceTransformer('all-MiniLM-L6-v2')
-
-su_conn_str = os.environ.get('AIBOT_PG_SUPERUSER_CONNECT_STRING')
-user_conn_str = os.environ.get('AIBOT_PG_USER_CONNECT_STRING')
-username = os.environ.get('AIBOT_PG_USER')
-password = os.environ.get('AIBOT_PG_USER_PASSWORD')
-tname = os.environ.get('AIBOT_PG_TABLE_NAME', 'discord_chat_history')
+pgvector_config = assemble_pgvector_config()
 
 async def create_app_user():
     # Connect as superuser (e.g., 'postgres')
-    conn = await asyncpg.connect(su_conn_str)
+    conn = await asyncpg.connect(pgvector_config['su_conn_str'])
     try:
         # Create the application user (idempotent: IF NOT EXISTS)
         await conn.execute('''
@@ -26,21 +21,21 @@ async def create_app_user():
             CREATE ROLE {username} WITH LOGIN PASSWORD '{password}';
             END IF;
             END $$;
-        '''.format(username=username, password=password))
+        '''.format(username=pgvector_config['username'], password=pgvector_config['password']))
         # Grant privileges on your table (replace 'discord_chat_history' if needed)
         await conn.execute(
-            f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {username};'
+            f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {pgvector_config["username"]};'
         )
         # (Optional) Grant usage on the schema if needed
         await conn.execute(
-            f'GRANT USAGE ON SCHEMA public TO {username};'
+            f'GRANT USAGE ON SCHEMA public TO {pgvector_config["username"]};'
         )
-        print(f'App user {username} created and privileges granted.')
+        print(f'App user {pgvector_config["username"]} created and privileges granted.')
     finally:
         await conn.close()
 
 async def db_setup():
-    db = await MessageDB.from_conn_string(su_conn_str, emodel, tname)
+    db = await MessageDB.from_conn_string(pgvector_config['su_conn_str'], pgvector_config['embedding_model'], pgvector_config['table_name'])
     await db.create_table()
     return db
 

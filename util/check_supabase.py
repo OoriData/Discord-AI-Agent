@@ -6,25 +6,22 @@ import asyncpg
 
 from sentence_transformers import SentenceTransformer
 from ogbujipt.embedding.pgvector import MessageDB
+from discord_aiagent import assemble_pgvector_config
 
-emodel = SentenceTransformer('all-MiniLM-L6-v2')
-
-su_conn_str = os.environ.get('AIBOT_PG_SUPERUSER_CONNECT_STRING')
-user_conn_str = os.environ.get('AIBOT_PG_USER_CONNECT_STRING')
-print(user_conn_str)
-username = os.environ.get('AIBOT_PG_USER')
-password = os.environ.get('AIBOT_PG_USER_PASSWORD')
-tname = os.environ.get('AIBOT_PG_TABLE_NAME', 'discord_chat_history')
+pgvector_config = assemble_pgvector_config()
 
 async def get_db():
-    db = await MessageDB.from_conn_string(su_conn_str, emodel, tname)
+    db = await MessageDB.from_conn_string(pgvector_config['su_conn_str'], pgvector_config['embedding_model'], pgvector_config['table_name'])
     return db
 
 async def main():
     # Test connect as superuser
-    conn = await asyncpg.connect(su_conn_str)
+    # print(pgvector_config['su_conn_str'])
+    conn = await asyncpg.connect(pgvector_config['su_conn_str'])
     # Test connect as app user
-    conn = await asyncpg.connect(user_conn_str)
+    # print(pgvector_config['conn_str'])
+    conn = await asyncpg.connect(pgvector_config['conn_str'])
+    await asyncio.sleep(3)
     # Test for OgbujiPT
     db = await get_db()
 
