@@ -25,9 +25,9 @@ import structlog  # type: ignore
 from ogbujipt.embedding.pgvector import MessageDB
 
 # Official MCP SDK imports
-from mcp.client.session_group import ClientSessionGroup, StreamableHttpParameters
-from mcp.types import Tool, ListToolsResult
-from mcp import McpError
+from fastmcp import Client
+from fastmcp.tools import Tool
+from fastmcp.exceptions import McpError
 
 # Tenacity for retry logic
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -51,8 +51,9 @@ try:
     ConnectError = httpx.ConnectError
     ReadTimeout = httpx.ReadTimeout
 except ImportError:
-    class ConnectError(IOError): pass
-    class ReadTimeout(TimeoutError): pass
+    raise
+    class ConnectError(Exception): pass
+    class ReadTimeout(Exception): pass
 
 from discord_aiagent.rssutil import RSSAgent
 from discord_aiagent.discordutil import send_long_message, handle_attachments, get_formatted_sysmsg
@@ -111,8 +112,8 @@ class MCPCog(commands.Cog, RSSAgent):
         RSSAgent.__init__(self, b4a_data, {}, 0)  # Initialize RSSAgent with empty cache
         self.bot = bot
         self.config = config  # Agent config (LLM, etc.)
-        self.mcp_connections: dict[str, StreamableHttpParameters] = {}  # Keyed by MCPConfig.name
-        self.mcp_tools: dict[str, list[Tool]] = {}  # Keyed by MCPConfig.name
+        self.mcp_urls: dict[str, str] = {}  # Keyed by MCPConfig.name, store URLs
+        self.mcp_tools: dict[str, list[Tool]] = {}  # Keyed by MCPConfig.name, cache tool definitions
         self.message_history: dict[int, list[dict[str, Any]]] = {}
 
         self._connection_tasks: dict[str, asyncio.Task] = {}
@@ -180,49 +181,35 @@ class MCPCog(commands.Cog, RSSAgent):
         retry=retry_if_exception_type((ConnectionError, McpError))
     )
     async def _manage_mcp_connection(self, mcp_config: MCPConfig):
-        '''Persistent task to manage a single MCP connection using the official MCP SDK.'''
+        '''Persistent task to manage MCP server discovery and tool caching.'''
         url = mcp_config.url
         name = mcp_config.name  # Use the name from B4A config
         reconnect_delay = 15  # Initial delay seconds
         max_reconnect_delay = 300  # Max delay seconds
 
         while not self._shutdown_event.is_set():
-            logger.info(f'Attempting connection for MCP source: \'{name}\'', url=url)
-            session_group: ClientSessionGroup | None = None
+            logger.info(f'Attempting to discover MCP source: \'{name}\'', url=url)
             try:
-                # Create session group for this MCP server
-                session_group = ClientSessionGroup()
+                # Create a temporary client to discover tools
+                client = Client(url)
                 
-                # Create connection parameters
-                connection_params = StreamableHttpParameters(
-                    url=url,
-                    timeout=45.0,  # 45 second timeout
-                    sse_read_timeout=30.0,  # 30 second SSE read timeout
-                    terminate_on_close=True
-                )
+                logger.info(f'Discovering tools for MCP source \'{name}\'...')
                 
-                logger.info(f'Connecting to MCP source \'{name}\'...')
+                # Connect and discover tools
+                async with client:
+                    # List tools to verify connection and get tool definitions
+                    tools_list = await client.list_tools()
                 
-                # Connect to the server
-                session = await session_group.connect_to_server(connection_params)
-                
-                # Initialize the session
-                await session.initialize()
-                
-                # List tools to verify connection and get tool definitions
-                tools_result = await session.list_tools()
-                tools_list = tools_result.tools if tools_result else []
-                
-                # Store the session group and tools
-                self.mcp_connections[name] = session_group
+                # Store the URL and tools for later use
+                self.mcp_urls[name] = url
                 self.mcp_tools[name] = tools_list
                 
-                logger.info(f'Connected to MCP source \'{name}\' and listed {len(tools_list)} tools.', server_name=name)
+                logger.info(f'Discovered MCP source \'{name}\' with {len(tools_list)} tools.', server_name=name)
                 reconnect_delay = 15  # Reset delay on success
 
                 # Wait for shutdown signal
                 await self._shutdown_event.wait()
-                logger.info(f'Shutdown signal received for {name}. Ending management task.')
+                logger.info(f'Shutdown signal received for {name}. Ending discovery task.')
                 break
 
             except McpError as mcp_err:
@@ -232,27 +219,22 @@ class MCPCog(commands.Cog, RSSAgent):
             except asyncio.TimeoutError:
                 logger.error(f'Timeout connecting or listing tools for MCP server {name}. Retrying…', server_name=name)
             except asyncio.CancelledError:
-                logger.info(f'Connection task for {name} cancelled.')
+                logger.info(f'Discovery task for {name} cancelled.')
                 break  # Exit loop immediately
             except Exception as e:
                 # Catch other errors from MCP SDK
-                logger.exception(f'Unexpected error managing connection for {name}. Retrying…', server_name=name, url=url)
+                logger.exception(f'Unexpected error discovering {name}. Retrying…', server_name=name, url=url)
 
             # Cleanup before Reconnect/Shutdown
             logger.debug(f'Cleaning up resources for {name} before retry/shutdown.')
-            if name in self.mcp_connections:
-                try:
-                    await self.mcp_connections[name].disconnect_from_server(name)
-                except Exception as cleanup_err:
-                    logger.warning(f'Error during cleanup for {name}: {cleanup_err}')
-                del self.mcp_connections[name]
+            if name in self.mcp_urls:
+                del self.mcp_urls[name]
             if name in self.mcp_tools:
                 del self.mcp_tools[name]
-            session_group = None
 
             # Wait before Retrying (if not shutting down)
             if not self._shutdown_event.is_set():
-                logger.info(f'Waiting {reconnect_delay}s before reconnecting to {name}.')
+                logger.info(f'Waiting {reconnect_delay}s before rediscovering {name}.')
                 try:
                     await asyncio.wait_for(self._shutdown_event.wait(), timeout=reconnect_delay)
                     logger.info(f'Shutdown signaled during reconnect delay for {name}.')
@@ -264,16 +246,11 @@ class MCPCog(commands.Cog, RSSAgent):
                      break  # Exit loop
 
         # Final Task Cleanup (on shutdown or cancellation)
-        logger.info(f'Connection management task for {name} finished cleanly.')
-        if name in self.mcp_connections: 
-            try:
-                await self.mcp_connections[name].disconnect_from_server(name)
-            except Exception:
-                pass  # Ignore cleanup errors during shutdown
-            del self.mcp_connections[name]
+        logger.info(f'Discovery task for {name} finished cleanly.')
+        if name in self.mcp_urls: 
+            del self.mcp_urls[name]
         if name in self.mcp_tools: 
             del self.mcp_tools[name]
-        session_group = None
 
     async def cog_load(self):
         '''
@@ -335,7 +312,7 @@ class MCPCog(commands.Cog, RSSAgent):
                 logger.info(f'Connection task for B4A MCP source \'{name}\' already running.')
                 active_task_count += 1
 
-        logger.info(f'MCPCog load processed. {active_task_count} connection tasks are active or starting.')
+        logger.info(f'MCPCog load processed. {active_task_count} discovery tasks are active or starting.')
         self.standing_prompt_loop.start()
         logger.info('Standing prompt loop started.')
 
@@ -376,16 +353,16 @@ class MCPCog(commands.Cog, RSSAgent):
         else:
              logger.info('No active connection tasks to stop.')
 
-        # Clean up session groups
-        for server_name, session_group in list(self.mcp_connections.items()):
+        # Clean up discovery tasks
+        for server_name in list(self.mcp_urls.keys()):
             try:
-                await session_group.disconnect_from_server(server_name)
-                logger.debug(f'Disconnected from MCP server: {server_name}')
+                del self.mcp_urls[server_name]
+                logger.debug(f'Removed MCP server from discovered list: {server_name}')
             except Exception as e:
-                logger.warning(f'Error disconnecting from MCP server {server_name}: {e}')
+                logger.warning(f'Error removing MCP server {server_name}: {e}')
 
         # Clear stored data regardless of task shutdown status
-        self.mcp_connections.clear()
+        self.mcp_urls.clear()
         self.mcp_tools.clear()
         self._connection_tasks.clear()  # Clear task references
         self._rss_feed_cache.clear()
@@ -457,8 +434,8 @@ class MCPCog(commands.Cog, RSSAgent):
 
     async def execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any] | dict[str, str]:
         '''
-        Execute an MCP tool or the RSS query tool.
-        Returns a dict with tool results or error information.
+        Execute a tool on the appropriate MCP server.
+        Returns a dict with either 'content' or 'error' key.
         '''
         logger.debug('Executing tool', tool_name=tool_name, tool_input=tool_input)
 
@@ -467,44 +444,56 @@ class MCPCog(commands.Cog, RSSAgent):
                 return {'error': 'RSS querying is disabled because the `feedparser` library is not installed.'}
             return await self.execute_rss_query(tool_input)
 
-        session_group: ClientSessionGroup | None = None
         server_name_found: str | None = None  # B4A source name
 
-        # Find the server/session group (keyed by B4A source name) that has the tool
-        for source_name, session_grp in self.mcp_connections.items():
+        # Find the server (keyed by B4A source name) that has the tool
+        for source_name, url in self.mcp_urls.items():
             # Check if the tool name exists in the list of tools for this server
             if source_name in self.mcp_tools and any(tool.name == tool_name for tool in self.mcp_tools[source_name]):
-                session_group = session_grp
                 server_name_found = source_name
-                logger.debug(f'Found active session group for tool `{tool_name}` on MCP source \'{server_name_found}\'.')
+                logger.debug(f'Found tool `{tool_name}` on MCP source \'{server_name_found}\'.')
                 break
 
-        if not session_group or not server_name_found:
-            logger.warning(f'MCP Tool `{tool_name}` not found on any *actively connected* MCP source.')
+        if not server_name_found:
+            logger.warning(f'MCP Tool `{tool_name}` not found on any *discovered* MCP source.')
             # Provide more specific error based on B4A data
             if not self.b4a_data.mcp_sources:
                 return {'error': f'Tool `{tool_name}` cannot be executed: No @mcp B4A sources configured.'}
-            if not self.mcp_connections:
-                return {'error': f'Tool `{tool_name}` cannot be executed: No MCP sources currently connected.'}
-            # Check if tool exists on a configured but disconnected source
+            if not self.mcp_urls:
+                return {'error': f'Tool `{tool_name}` cannot be executed: No MCP sources currently discovered.'}
+            # Check if tool exists on a configured but undiscovered source
             origin_source = next((s.name for s in self.b4a_data.mcp_sources if s.name in self.mcp_tools and any(t.name == tool_name for t in self.mcp_tools[s.name])), None)
-            if origin_source and origin_source not in self.mcp_connections:
-                return {'error': f'Tool `{tool_name}` exists (on MCP source \'{origin_source}\'), but it\'s currently disconnected.'}
-            return {'error': f'Tool `{tool_name}` not found on any configured and connected MCP source.'}
+            if origin_source and origin_source not in self.mcp_urls:
+                return {'error': f'Tool `{tool_name}` exists (on MCP source \'{origin_source}\'), but it\'s currently undiscovered.'}
+            return {'error': f'Tool `{tool_name}` not found on any configured and discovered MCP source.'}
 
         logger.info(f'Calling MCP tool `{tool_name}` on MCP server `{server_name_found}`')
         try:
-            # Call the tool using the session group's call_tool method
-            result = await asyncio.wait_for(
-                session_group.call_tool(tool_name, tool_input),
-                timeout=120.0  # FIXME: Make configurable
-            )
+            # Create a new client for this tool call
+            client = Client(self.mcp_urls[server_name_found])
             
-            logger.debug(f'Tool `{tool_name}` executed via MCP SDK.', result_content=result.content)
+            # Execute the tool using the context manager
+            async with client:
+                result = await asyncio.wait_for(
+                    client.call_tool(tool_name, tool_input),
+                    timeout=120.0  # FIXME: Make configurable
+                )
             
-            # The result should be a dict with the tool's response
-            if isinstance(result, dict):
-                return result
+            logger.debug(f'Tool `{tool_name}` executed via MCP SDK.', result_content=result)
+            
+            # The result should be a list of content objects
+            if isinstance(result, list) and len(result) > 0:
+                # Extract text content from the result
+                text_content = []
+                for content in result:
+                    if hasattr(content, 'text'):
+                        text_content.append(content.text)
+                    elif hasattr(content, 'type') and content.type == 'text':
+                        text_content.append(content.text)
+                    else:
+                        text_content.append(str(content))
+                
+                return {'content': '\n'.join(text_content)}
             else:
                 # Convert other result types to dict format
                 return {'content': str(result)}
@@ -515,26 +504,18 @@ class MCPCog(commands.Cog, RSSAgent):
         except McpError as mcp_err:
             # Catch MCP-specific errors
             logger.error(f'MCP error during tool call `{tool_name}` on server `{server_name_found}`: {type(mcp_err).__name__}', tool_input=tool_input, error=str(mcp_err))
-            # Remove the session group reference; the management task will handle reconnection.
-            if server_name_found in self.mcp_connections: 
-                try:
-                    await self.mcp_connections[server_name_found].disconnect_from_server(server_name_found)
-                except Exception:
-                    pass
-                del self.mcp_connections[server_name_found]
+            # Remove the server from discovered list; the discovery task will handle rediscovery
+            if server_name_found in self.mcp_urls: 
+                del self.mcp_urls[server_name_found]
             if server_name_found in self.mcp_tools: 
                 del self.mcp_tools[server_name_found]
             return {'error': f'MCP error executing tool `{tool_name}`: {str(mcp_err)}'}
         except ConnectionError as conn_err:
             # Catch connection-related errors during the tool call
             logger.error(f'Connection error during MCP tool call `{tool_name}` on server `{server_name_found}`: {type(conn_err).__name__}', tool_input=tool_input, error=str(conn_err))
-            # Remove the session group reference; the management task will handle reconnection.
-            if server_name_found in self.mcp_connections: 
-                try:
-                    await self.mcp_connections[server_name_found].disconnect_from_server(server_name_found)
-                except Exception:
-                    pass
-                del self.mcp_connections[server_name_found]
+            # Remove the server from discovered list; the discovery task will handle rediscovery
+            if server_name_found in self.mcp_urls: 
+                del self.mcp_urls[server_name_found]
             if server_name_found in self.mcp_tools: 
                 del self.mcp_tools[server_name_found]
             return {'error': f'Connection error executing MCP tool `{tool_name}`. The server may be temporarily unavailable. Please try again.'}
@@ -563,7 +544,7 @@ class MCPCog(commands.Cog, RSSAgent):
         Format active MCP tools and the RSS query tool for OpenAI API.
         '''
         openai_tools = []
-        active_server_names = list(self.mcp_connections.keys())
+        active_server_names = list(self.mcp_urls.keys())
 
         for server_name in active_server_names:
             if server_name not in self.mcp_tools:
@@ -748,7 +729,7 @@ class MCPCog(commands.Cog, RSSAgent):
                     extra_chat_params,
                     stream=stream
                 )
-            except MissingLLMResponseError | LLMResponseError as llm_err:
+            except (MissingLLMResponseError, LLMResponseError) as llm_err:
                 await send_long_message(sendable, llm_err.message, followup=send_followup, ephemeral=can_be_ephemeral)
                 return
             except Exception as e:  # Catch other unexpected errors (e.g., network)
@@ -943,9 +924,9 @@ class MCPCog(commands.Cog, RSSAgent):
             name = mcp_conf.name
             status_icon = '❓'
             status_text = 'Unknown'
-            if name in self.mcp_connections and name in self.mcp_tools:
+            if name in self.mcp_urls and name in self.mcp_tools:
                 status_icon = '🟢'; status_text = f'Connected ({len(self.mcp_tools[name])} tools)'
-            elif name in self.mcp_connections:
+            elif name in self.mcp_urls:
                 status_icon = '🟡'; status_text = 'Connected (Tool list issue?)'
             elif name in self._connection_tasks and not self._connection_tasks[name].done():
                 status_icon = '🟠'; status_text = 'Connecting…'
@@ -1010,10 +991,10 @@ class MCPCog(commands.Cog, RSSAgent):
                 name = mcp_conf.name
                 status_icon = '❓'; status_text = 'Unknown'
                 tools_available = False
-                if name in self.mcp_connections and name in self.mcp_tools:
+                if name in self.mcp_urls and name in self.mcp_tools:
                     status_icon = '🟢'; status_text = f'Connected ({len(self.mcp_tools[name])} tools listed)'
                     tools_available = bool(self.mcp_tools[name])
-                elif name in self.mcp_connections:
+                elif name in self.mcp_urls:
                     status_icon = '🟡'; status_text = 'Connected (Tool list issue?)'
                 elif name in self._connection_tasks and not self._connection_tasks[name].done():
                     status_icon = '🟠'; status_text = 'Connecting…'

@@ -9,3 +9,5 @@ uvicorn
 fire
 pydantic
 rich  # Optional for CLI formatting
+flask
+asgiref

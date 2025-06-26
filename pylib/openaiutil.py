@@ -106,6 +106,83 @@ def format_calltoolresult_content(result: dict[str, Any] | dict[str, str]) -> st
         return f'Unexpected tool result format: {str(result)[:200]}'
 
 
+def _log_openai_error_details(error: OpenAIError, context: str, connection_info: dict[str, Any]) -> str:
+    """
+    Log detailed information about OpenAI errors and return a user-friendly message.
+    
+    Args:
+        error: The OpenAIError that occurred
+        context: Context string (e.g., 'initial LLM call', 'follow-up LLM call')
+        connection_info: Dict containing connection details (base_url, model, etc.)
+    
+    Returns:
+        User-friendly error message
+    """
+    error_type = type(error).__name__
+    error_str = str(error)
+    
+    # Extract connection details for logging
+    base_url = connection_info.get('base_url', 'unknown')
+    model = connection_info.get('model', 'unknown')
+    
+    # Log the error with connection details
+    logger.error(
+        f'OpenAI {error_type} during {context}',
+        error_type=error_type,
+        error_message=error_str,
+        base_url=base_url,
+        model=model,
+        context=context
+    )
+    
+    # Provide more specific error messages based on error type
+    if 'Connection' in error_type or 'Connect' in error_type or 'Network' in error_type:
+        logger.error(
+            f'Connection error details for {context}',
+            base_url=base_url,
+            model=model,
+            error_details=error_str
+        )
+        return f'⚠️ Connection error: Unable to reach LLM server at {base_url}. Please check if the server is running.'
+    
+    elif 'Timeout' in error_type:
+        logger.error(
+            f'Timeout error details for {context}',
+            base_url=base_url,
+            model=model,
+            error_details=error_str
+        )
+        return f'⚠️ Timeout error: LLM server at {base_url} did not respond in time. The server may be overloaded.'
+    
+    elif 'Authentication' in error_type or 'API key' in error_str.lower():
+        logger.error(
+            f'Authentication error details for {context}',
+            base_url=base_url,
+            model=model,
+            error_details=error_str
+        )
+        return f'⚠️ Authentication error: Invalid API key or authentication failed for {base_url}.'
+    
+    elif 'Rate limit' in error_str.lower() or 'quota' in error_str.lower():
+        logger.error(
+            f'Rate limit error details for {context}',
+            base_url=base_url,
+            model=model,
+            error_details=error_str
+        )
+        return f'⚠️ Rate limit error: Too many requests to LLM server at {base_url}. Please try again later.'
+    
+    else:
+        # Generic error with connection info
+        logger.error(
+            f'Generic OpenAI error details for {context}',
+            base_url=base_url,
+            model=model,
+            error_details=error_str
+        )
+        return f'⚠️ Error communicating with AI at {base_url}: {error_str}'
+
+
 # Corresponding to the errors logged via send_long_message below, which will instead be raised up the stack
 class MissingLLMResponseError(Exception):
     ''' Raised when the LLM response is missing a message object'''
@@ -149,6 +226,11 @@ class OpenAILLMWrapper:
         self.llm_client = AsyncOpenAI(**init_params)
         self.llm_chat_params = chat_params
         self.tool_handler = tool_handler
+        # Store connection info for error logging
+        self.connection_info = {
+            'base_url': init_params.get('base_url', 'unknown'),
+            'model': chat_params.get('model', 'unknown')
+        }
 
     async def __call__(self, messages: list[dict], user: str, extra_chat_params: dict,  stream: bool = False):
         '''
@@ -201,7 +283,8 @@ class OpenAILLMWrapper:
                         tool_calls_aggregated, initial_response_content = parsed_calls, updated_content
 
         except OpenAIError as api_exc:
-            raise MissingLLMResponseError(f'⚠️ Error communicating with AI: {str(api_exc)}') 
+            error_message = _log_openai_error_details(api_exc, 'initial LLM call', self.connection_info)
+            raise MissingLLMResponseError(error_message)
         return initial_response_content, tool_calls_aggregated
 
     async def process_tool_calls(self, tool_calls_aggregated, messages, thread_id, user, tool_call_result_hook, stream=False):
@@ -300,7 +383,7 @@ class OpenAILLMWrapper:
                     if follow_up_message: follow_up_text = follow_up_message.content or ''
 
             except OpenAIError as exc:  # Catch specific OpenAI errors
-                raise MissingLLMResponseError(f'⚠️ Error communicating with AI during follow-up LLM call: {str(exc)}')
-                return
+                error_message = _log_openai_error_details(exc, 'follow-up LLM call', self.connection_info)
+                raise MissingLLMResponseError(error_message)
 
         return follow_up_text

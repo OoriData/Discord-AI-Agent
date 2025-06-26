@@ -8,8 +8,8 @@ description = "A basket of silly demo tools"
 type = "@mcp" # REQUIRED: Specifies the integration handler type.
 
 # Configuration specific to the '.mcp' handler:
-connection_method = "sse" # REQUIRED: How to communicate (e.g., 'sse', 'stdio').
-url = "http://localhost:8902/sse" # REQUIRED: Endpoint for the MCP Server (SSE example).
+connection_method = "http" # REQUIRED: How to communicate (e.g., 'http', 'stdio').
+url = "http://localhost:8902/http" # REQUIRED: Endpoint for the MCP Server (HTTP example).
 # Or for stdio:
 # connection_method = "stdio"
 # command = ["python", "path/to/mcp_server_script.py"]

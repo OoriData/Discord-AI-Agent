@@ -55,6 +55,15 @@ export AIBOT_DISCORD_CONFIG_PATH="./config"
 python mcp_discord_bot.py # Reads from env vars
 ```
 
+# Quick start
+
+Launch servers & bot, then DM the bot
+
+Use command `/context_info`
+
+Use command `/context_details`
+
+
 # Sample queries
 
 ## From the toy MCP servers
