@@ -19,10 +19,13 @@ async def create_app_user():
             DO $$ BEGIN 
             IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{username}') THEN 
             CREATE ROLE {username} WITH LOGIN PASSWORD '{password}';
+            ALTER ROLE {username} BYPASSRLS;
             END IF;
             END $$;
         '''.format(username=pgvector_config['username'], password=pgvector_config['password']))
         # Grant privileges on your table (replace 'discord_chat_history' if needed)
+        # Note: When RLS is enabled but no policies exist, PG blocks ALL access by default - even for roles
+        # granted as below. The above `ALTER ROLE {username} BYPASSRLS` is required to allow access.
         await conn.execute(
             f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {pgvector_config["username"]};'
         )

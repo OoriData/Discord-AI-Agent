@@ -12,6 +12,9 @@ import io
 from typing import Any
 from pathlib import Path
 
+# Save original exception hook before any imports that might install Rich tracebacks
+_original_excepthook = sys.excepthook
+
 import fire
 import discord
 from discord.ext import commands
@@ -28,11 +31,13 @@ logger = structlog.get_logger()
 
 def setup_logging(classic_tracebacks: bool = False, log_level_str: str = 'INFO'):
     '''Configures structlog processors and rendering.'''
-    console_renderer_kwargs = {'colors': True}
     if classic_tracebacks:
-        logger.info('Configuring logging (classic_tracebacks=True, using default Rich exceptions).')
+        # Use a simple but readable renderer that doesn't use Rich
+        renderer = structlog.dev.ConsoleRenderer(colors=False, exception_formatter=structlog.dev.plain_traceback)
     else:
-         logger.info('Configuring logging with standard (rich) tracebacks.')
+        # Use Rich renderer for enhanced output
+        console_renderer_kwargs = {'colors': True}
+        renderer = structlog.dev.ConsoleRenderer(**console_renderer_kwargs)
 
     shared_processors = [
         structlog.contextvars.merge_contextvars,
@@ -51,7 +56,7 @@ def setup_logging(classic_tracebacks: bool = False, log_level_str: str = 'INFO')
     )
 
     formatter = structlog.stdlib.ProcessorFormatter(
-        processor=structlog.dev.ConsoleRenderer(**console_renderer_kwargs),
+        processor=renderer,
     )
 
     handler = logging.StreamHandler(sys.stderr)
@@ -144,7 +149,18 @@ def main(
     # Call setup_logging *before* other logging, passing the determined level
     # Use upper case for consistency
     effective_loglevel_upper = effective_loglevel.upper()
-    setup_logging(classic_tracebacks, log_level_str=effective_loglevel_upper)
+    setup_logging(classic_tracebacks=classic_tracebacks, log_level_str=effective_loglevel_upper)
+    
+    # Configure traceback handling based on classic_tracebacks option
+    if classic_tracebacks:
+        logger.info('Using classic Python tracebacks (Rich tracebacks disabled).')
+        # Restore the original exception hook to disable Rich tracebacks
+        sys.excepthook = _original_excepthook
+        logger.debug('Restored original exception hook.')
+    else:
+        logger.info('Installing Rich tracebacks for enhanced error display.')
+        rich.traceback.install(show_locals=False, extra_lines=1, word_wrap=True)
+    
     # Log the source *after* setup_logging might have changed the level
     if log_source != "default":
         logger.info(f"Log level '{effective_loglevel_upper}' set via {log_source}.")
@@ -256,5 +272,4 @@ def main(
 
 
 if __name__ == '__main__':
-    rich.traceback.install(show_locals=False, extra_lines=1, word_wrap=True)
     fire.Fire(main)

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "discord-ai-agent"
-# dynamic = ["version"]
-version = "0.0.3"
+dynamic = ["version"]
+# version = "0.0.3"
 description = "Discord bot for supporting AI/LLM chat applications powered by the Model Context Protocol (MCP), allowing for numerous integrations"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,16 +26,13 @@ classifiers = [
 dependencies = [  # https://hatch.pypa.io/latest/config/dependency/
     "discord>=2.3.2",
     "fire>=0.7.0",
-    # "mcp>=1.6.0",
+    "fastmcp",  # Rather than mcp, which is "official", but 1.x & not as well maintained
     "ogbujipt>=0.9.6",
     "rich>=14.0.0",
     "structlog>=25.2.0",
     "httpx>=0.25.0", # Added httpx
-    # "mcp-sse-client @ git+https://github.com/zanetworker/mcp-sse-client-python.git@f397a8e", # Added git dependency
+    "tenacity>=8.2.0", # For retry logic
 ]
-
-[tool.poetry.dependencies]  # Uses new PEP 508 format. Pulling from GitHub because package is not yet on PyPI
-mcp-sse-client = "https://github.com/zanetworker/mcp-sse-client-python.git#f397a8e"
 
 # Optional dependencies
 [project.optional-dependencies]

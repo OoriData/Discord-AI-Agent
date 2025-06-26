@@ -10,7 +10,6 @@ from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageToolCa
 from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceDelta
 
 import structlog
-from mcp_sse_client import ToolInvocationResult
 
 logger = structlog.get_logger(__name__)
 
@@ -62,56 +61,126 @@ def extract_tool_calls_from_content(content: str) -> tuple[list[dict], str]:
     return [], content  # Return empty list and original content if no calls found/parsed
 
 
-def format_calltoolresult_content(result: ToolInvocationResult | dict[str, str]) -> str:
+def format_calltoolresult_content(result: dict[str, Any] | dict[str, str]) -> str:
     '''
-    Extract content from a ToolInvocationResult object or format error dict.
+    Extract content from a tool result dict.
     Handles common MCP content structures like text content.
     '''
-    if isinstance(result, ToolInvocationResult):
-        # ToolInvocationResult has .content and .error_code
-        # We assume execute_tool already converted errors to the dict format.
-        # So, if we receive ToolInvocationResult here, it should be a success.
-        content = result.content
-        if content is None:
-                # Assume tool_name attribute exists on ToolInvocationResult based on library structure
-                tool_name_attr = getattr(result, 'tool_name', 'unknown_tool')
-                logger.warning('MCP ToolInvocationResult received with None content.', tool_name=tool_name_attr, error_code=result.error_code)  # Assuming tool_name exists
-                return 'Tool executed successfully but returned no content.'
-
-        if isinstance(content, dict) and content.get('type') == 'text' and 'text' in content:
-                text_content = content['text']
-                # Return the text directly, converting simple types to string
-                return str(text_content) if text_content is not None else ''
-
-        # Handle other types (simple types, lists, other dicts)
-        elif isinstance(content, (str, int, float, bool)):
-            return str(content)
-        elif isinstance(content, (dict, list)):
-            try:
-                # Nicely format other JSON-like structures
-                return json.dumps(content, indent=2)
-            except TypeError as json_err:
-                logger.warning('Could not JSON serialize MCP tool result content.', content_type=type(content), error=str(json_err))
-                return str(content)  # Fallback
-        else:
-            logger.warning('Unexpected type for MCP ToolInvocationResult content.', content_type=type(content))
-            return str(content)
-
-    elif isinstance(result, dict):
+    if isinstance(result, dict):
         # Handle RSS result or any error dict
         if 'result' in result:
             return str(result['result'])  # Return the formatted RSS result string
         elif 'error' in result:
             return f'Tool Error: {result['error']}'  # Return formatted error
+        elif 'content' in result:
+            content = result['content']
+            if content is None:
+                return 'Tool executed successfully but returned no content.'
+            
+            if isinstance(content, dict) and content.get('type') == 'text' and 'text' in content:
+                text_content = content['text']
+                # Return the text directly, converting simple types to string
+                return str(text_content) if text_content is not None else ''
+            elif isinstance(content, (str, int, float, bool)):
+                return str(content)
+            elif isinstance(content, (dict, list)):
+                try:
+                    # Nicely format other JSON-like structures
+                    return json.dumps(content, indent=2)
+                except TypeError as json_err:
+                    logger.warning('Could not JSON serialize MCP tool result content.', content_type=type(content), error=str(json_err))
+                    return str(content)  # Fallback
+            else:
+                logger.warning('Unexpected type for MCP tool result content.', content_type=type(content))
+                return str(content)
         else:
             # Gracefully handle unexpected dict format
             logger.warning('Unexpected dict format received in format_calltoolresult_content', received_result=result)
-            try: return json.dumps(result, indent=2)
-            except TypeError: return f'Unexpected tool result format: {str(result)[:200]}'
+            try: 
+                return json.dumps(result, indent=2)
+            except TypeError: 
+                return f'Unexpected tool result format: {str(result)[:200]}'
     else:
         # Gracefully handle unexpected types
         logger.warning('Unexpected format received in format_calltoolresult_content', received_result=result)
         return f'Unexpected tool result format: {str(result)[:200]}'
+
+
+def _log_openai_error_details(error: OpenAIError, context: str, connection_info: dict[str, Any]) -> str:
+    """
+    Log detailed information about OpenAI errors and return a user-friendly message.
+    
+    Args:
+        error: The OpenAIError that occurred
+        context: Context string (e.g., 'initial LLM call', 'follow-up LLM call')
+        connection_info: Dict containing connection details (base_url, model, etc.)
+    
+    Returns:
+        User-friendly error message
+    """
+    error_type = type(error).__name__
+    error_str = str(error)
+    
+    # Extract connection details for logging
+    base_url = connection_info.get('base_url', 'unknown')
+    model = connection_info.get('model', 'unknown')
+    
+    # Log the error with connection details
+    logger.error(
+        f'OpenAI {error_type} during {context}',
+        error_type=error_type,
+        error_message=error_str,
+        base_url=base_url,
+        model=model,
+        context=context
+    )
+    
+    # Provide more specific error messages based on error type
+    if 'Connection' in error_type or 'Connect' in error_type or 'Network' in error_type:
+        logger.error(
+            f'Connection error details for {context}',
+            base_url=base_url,
+            model=model,
+            error_details=error_str
+        )
+        return f'⚠️ Connection error: Unable to reach LLM server at {base_url}. Please check if the server is running.'
+    
+    elif 'Timeout' in error_type:
+        logger.error(
+            f'Timeout error details for {context}',
+            base_url=base_url,
+            model=model,
+            error_details=error_str
+        )
+        return f'⚠️ Timeout error: LLM server at {base_url} did not respond in time. The server may be overloaded.'
+    
+    elif 'Authentication' in error_type or 'API key' in error_str.lower():
+        logger.error(
+            f'Authentication error details for {context}',
+            base_url=base_url,
+            model=model,
+            error_details=error_str
+        )
+        return f'⚠️ Authentication error: Invalid API key or authentication failed for {base_url}.'
+    
+    elif 'Rate limit' in error_str.lower() or 'quota' in error_str.lower():
+        logger.error(
+            f'Rate limit error details for {context}',
+            base_url=base_url,
+            model=model,
+            error_details=error_str
+        )
+        return f'⚠️ Rate limit error: Too many requests to LLM server at {base_url}. Please try again later.'
+    
+    else:
+        # Generic error with connection info
+        logger.error(
+            f'Generic OpenAI error details for {context}',
+            base_url=base_url,
+            model=model,
+            error_details=error_str
+        )
+        return f'⚠️ Error communicating with AI at {base_url}: {error_str}'
 
 
 # Corresponding to the errors logged via send_long_message below, which will instead be raised up the stack
@@ -157,6 +226,11 @@ class OpenAILLMWrapper:
         self.llm_client = AsyncOpenAI(**init_params)
         self.llm_chat_params = chat_params
         self.tool_handler = tool_handler
+        # Store connection info for error logging
+        self.connection_info = {
+            'base_url': init_params.get('base_url', 'unknown'),
+            'model': chat_params.get('model', 'unknown')
+        }
 
     async def __call__(self, messages: list[dict], user: str, extra_chat_params: dict,  stream: bool = False):
         '''
@@ -209,7 +283,8 @@ class OpenAILLMWrapper:
                         tool_calls_aggregated, initial_response_content = parsed_calls, updated_content
 
         except OpenAIError as api_exc:
-            raise MissingLLMResponseError(f'⚠️ Error communicating with AI: {str(api_exc)}') 
+            error_message = _log_openai_error_details(api_exc, 'initial LLM call', self.connection_info)
+            raise MissingLLMResponseError(error_message)
         return initial_response_content, tool_calls_aggregated
 
     async def process_tool_calls(self, tool_calls_aggregated, messages, thread_id, user, tool_call_result_hook, stream=False):
@@ -308,7 +383,7 @@ class OpenAILLMWrapper:
                     if follow_up_message: follow_up_text = follow_up_message.content or ''
 
             except OpenAIError as exc:  # Catch specific OpenAI errors
-                raise MissingLLMResponseError(f'⚠️ Error communicating with AI during follow-up LLM call: {str(exc)}')
-                return
+                error_message = _log_openai_error_details(exc, 'follow-up LLM call', self.connection_info)
+                raise MissingLLMResponseError(error_message)
 
         return follow_up_text
