@@ -59,9 +59,19 @@ python mcp_discord_bot.py # Reads from env vars
 
 Launch servers & bot, then DM the bot
 
-Use command `/context_info`
+- Use command `/context_info`
 
-Use command `/context_details`
+- Use command `/context_details`
+
+- Try out some sample queries listed below
+
+- Set up a standing prompt
+
+`/set_standing_prompt`
+
+Pick `schedule:"Hourly"`, then write a prompt, for example, if you do have the RSS query tool set up to include Reddit's LocalLLaMa community, you could try:
+`Summarize the latest news about AI development from LocalLlama`
+
 
 
 # Sample queries

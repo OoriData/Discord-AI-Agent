@@ -1177,35 +1177,60 @@ class MCPCog(commands.Cog, RSSAgent):
                     is_due = True
 
             if is_due:
-                logger.info(f'Standing prompt {sp.id} for channel {sp.channel_id} is due. Text: "{sp.prompt_text[:50]}..."')
-                # Update last_run_time *before* execution to prevent rapid retries on failure
-                sp.last_run_time = current_time  # Mark as "attempted to run"
+                await self._execute_standing_prompt(sp, current_time)
 
-                channel = self.bot.get_channel(sp.channel_id)
-                if not channel:
-                    logger.warning(f'Channel {sp.channel_id} for standing prompt {sp.id} not found. Skipping.')
-                    continue
-                if not isinstance(channel, discord_abc.Messageable):  # Should be TextChannel or similar
-                    logger.warning(f'Channel {sp.channel_id} for standing prompt {sp.id} is not messageable. Type: {type(channel)}. Skipping.')
-                    continue
+    async def _execute_standing_prompt(self, sp: StandingPrompt, current_time: float):
+        """Helper function to execute a standing prompt."""
+        logger.info(f'Standing prompt {sp.id} for channel {sp.channel_id} is due. Text: "{sp.prompt_text[:50]}..."')
+        # Update last_run_time *before* execution to prevent rapid retries on failure
+        sp.last_run_time = current_time  # Mark as "attempted to run"
 
-                try:
-                    await channel.send(f'🤖 Running scheduled prompt from <@{sp.user_id}>: "{sp.prompt_text}"')
-                    await self._handle_chat_logic(
-                        sendable=channel,
-                        message=sp.prompt_text,
-                        channel_id=sp.channel_id,
-                        user_id=sp.user_id,
-                        stream=False,  # Scheduled tasks likely better non-streamed
-                        attachments=None
-                    )
-                    logger.info(f'Successfully ran standing prompt {sp.id}. Next run roughly in {sp.interval_seconds}s from now.')
-                except Exception as e:
-                    logger.exception(f'Error executing standing prompt {sp.id} for channel {sp.channel_id}: {e}')
-                    try:
-                        await channel.send(f'⚠️ Error running scheduled prompt: "{sp.prompt_text}". Will try again at the next scheduled interval. Please check bot logs.')
-                    except Exception as send_err:
-                        logger.error(f'Failed to send error message for standing prompt {sp.id} to channel {sp.channel_id}: {send_err}')
+        # Try multiple methods to get the channel
+        channel = None
+        
+        # Method 1: Try bot's channel cache
+        channel = self.bot.get_channel(sp.channel_id)
+        if channel:
+            logger.debug(f'Found channel {sp.channel_id} via bot.get_channel()')
+        
+        # Method 2: If not found, try to fetch it from Discord API
+        if not channel:
+            logger.debug(f'Channel {sp.channel_id} not in cache, attempting to fetch from Discord API')
+            try:
+                channel = await self.bot.fetch_channel(sp.channel_id)
+                logger.debug(f'Successfully fetched channel {sp.channel_id} from Discord API')
+            except discord.NotFound:
+                logger.warning(f'Channel {sp.channel_id} for standing prompt {sp.id} not found on Discord (deleted or bot removed)')
+                return
+            except discord.Forbidden:
+                logger.warning(f'Bot lacks permissions to access channel {sp.channel_id} for standing prompt {sp.id}')
+                return
+            except Exception as e:
+                logger.warning(f'Error fetching channel {sp.channel_id} for standing prompt {sp.id}: {e}')
+                return
+        
+        # Verify channel is messageable
+        if not isinstance(channel, discord_abc.Messageable):
+            logger.warning(f'Channel {sp.channel_id} for standing prompt {sp.id} is not messageable. Type: {type(channel)}. Skipping.')
+            return
+
+        try:
+            await channel.send(f'🤖 Running scheduled prompt from <@{sp.user_id}>: "{sp.prompt_text}"')
+            await self._handle_chat_logic(
+                sendable=channel,
+                message=sp.prompt_text,
+                channel_id=sp.channel_id,
+                user_id=sp.user_id,
+                stream=False,  # Scheduled tasks likely better non-streamed
+                attachments=None
+            )
+            logger.info(f'Successfully ran standing prompt {sp.id}. Next run roughly in {sp.interval_seconds}s from now.')
+        except Exception as e:
+            logger.exception(f'Error executing standing prompt {sp.id} for channel {sp.channel_id}: {e}')
+            try:
+                await channel.send(f'⚠️ Error running scheduled prompt: "{sp.prompt_text}". Will try again at the next scheduled interval. Please check bot logs.')
+            except Exception as send_err:
+                logger.error(f'Failed to send error message for standing prompt {sp.id} to channel {sp.channel_id}: {send_err}')
 
     @standing_prompt_loop.before_loop
     async def before_standing_prompt_loop(self):
@@ -1226,4 +1251,29 @@ class MCPCog(commands.Cog, RSSAgent):
         new_prompt = StandingPrompt(schedule_type=selected_schedule_type, prompt_text=prompt, channel_id=interaction.channel_id, user_id=interaction.user.id)
         self.standing_prompts.append(new_prompt)
         logger.info(f'New standing prompt added: ID {new_prompt.id}, Schedule: {new_prompt.schedule_type.value}, Channel: {new_prompt.channel_id}, User: {new_prompt.user_id}')
-        await interaction.response.send_message(f'✅ Standing prompt set! I will ask "{prompt[:100]}..." {selected_schedule_type.value.lower()} in this channel.\nPrompt ID: `{new_prompt.id}` (for future management).', ephemeral=False)
+        
+        # Send initial confirmation
+        await interaction.response.send_message(f'✅ Standing prompt set! I will ask "{prompt[:100]}..." {selected_schedule_type.value.lower()} in this channel.\nPrompt ID: `{new_prompt.id}` (for future management).\n\n🚀 Running the prompt now...', ephemeral=False)
+        
+        # Immediately execute the prompt using the interaction's channel
+        try:
+            logger.info(f'Executing initial standing prompt {new_prompt.id} for channel {new_prompt.channel_id}')
+            await interaction.channel.send(f'🤖 Running scheduled prompt from <@{new_prompt.user_id}>: "{new_prompt.prompt_text}"')
+            await self._handle_chat_logic(
+                sendable=interaction.channel,
+                message=new_prompt.prompt_text,
+                channel_id=new_prompt.channel_id,
+                user_id=new_prompt.user_id,
+                stream=False,  # Scheduled tasks likely better non-streamed
+                attachments=None
+            )
+            # Update last_run_time to prevent immediate re-execution in the loop
+            new_prompt.last_run_time = time.time()
+            logger.info(f'Successfully ran initial standing prompt {new_prompt.id}. Next run roughly in {new_prompt.interval_seconds}s from now.')
+        except Exception as e:
+            logger.exception(f'Error executing initial standing prompt {new_prompt.id}: {e}')
+            # Try to send error message to channel
+            try:
+                await interaction.channel.send(f'⚠️ Error running initial prompt: "{prompt}". Will try again at the next scheduled interval.')
+            except Exception as send_err:
+                logger.error(f'Failed to send error message for initial standing prompt {new_prompt.id}: {send_err}')
