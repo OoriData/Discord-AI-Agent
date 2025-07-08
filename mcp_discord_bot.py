@@ -29,6 +29,18 @@ from discord_aiagent import assemble_pgvector_config
 
 logger = structlog.get_logger()
 
+# List all loggers
+# for name in logging.root.manager.loggerDict:
+#     print(name)
+
+# List of known loggers with too much chatter at debug level
+TAME_LOGGERS = ['asyncio', 'httpcore', 'httpx', 'discord', 'aiohttp', 'urllib3', 'torch', 'requests'
+                'openai', 'sentence_transformers', 'transformers', 'asyncpg',
+                'mcp']
+for tl in TAME_LOGGERS:
+    logging.getLogger(tl).setLevel(logging.WARNING)
+
+
 def setup_logging(classic_tracebacks: bool = False, log_level_str: str = 'INFO'):
     '''Configures structlog processors and rendering.'''
     if classic_tracebacks:

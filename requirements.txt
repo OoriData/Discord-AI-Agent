@@ -5,3 +5,5 @@ asyncpg
 pgvector
 sentence_transformers
 tenacity
+chonkie
+html2text

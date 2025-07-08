@@ -17,6 +17,10 @@ url = "https://www.example.com/rss/news" # REQUIRED: The URL of the feed.
 # description = "News from the LocalLLaMA subreddit, a community for allsorts of open-source LLM and GenAI models & tools."
 # url = "https://www.reddit.com/r/LocalLLaMA.rss"
 
-# Optional configuration for the handler:
+# Optional configuration of the handler for this source
 # refresh_interval = "1h" # Example: How often the agent should check for updates.
 # max_items = 10 # Example: Limit the number of items processed.
+
+# Optional vector search configuration for semantic filtering of this source
+# cosine_similarity_threshold = 0.65  # Default threshold for semantic match (0.0-1.0)
+# top_k = 5  # Default number of top results to return

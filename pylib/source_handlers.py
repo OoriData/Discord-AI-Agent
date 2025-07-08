@@ -1,4 +1,4 @@
-# source_handlers.py
+# discord_aiagent.source_handlers
 '''
 Actual handling of tools & data resources via B4A & MCP
 '''
@@ -87,8 +87,13 @@ async def fetch_and_parse_rss(
 
         # Basic check if entries exist (or if it's a valid feed structure)
         if not hasattr(parsed_feed, 'entries'):
-             logger.warning('Parsed RSS feed missing "entries" attribute', url=url)
-             return None, f'Could not find any entries in the feed from {url}. It might be empty or not a valid feed.'
+             logger.warning('Parsed RSS feed missing `entries` attribute', url=url)
+             return None, f'An unexpected error occurred while parsing the feed from {url}.'
+
+        # Check if feed has any entries
+        if not parsed_feed.entries:
+            logger.warning('RSS feed has no entries', url=url)
+            return None, f'Could not find any entries in the feed from {url}. It might be empty or not a valid feed.'
 
         logger.debug('Parsed RSS feed successfully', url=url, entries_found=len(parsed_feed.entries))
 

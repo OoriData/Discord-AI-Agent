@@ -65,13 +65,36 @@ Launch servers & bot, then DM the bot
 
 - Try out some sample queries listed below
 
+- Check some of your registered tools
+
+```
+/invoke_tool tool_name:add tool_input:{"a": 1234, "b": 5678}
+```
+
+```
+/invoke_tool tool_name:magic_8_ball tool_input:{}
+```
+
+- Check some of your registered RSS feeds, including some different 
+
+```
+/invoke_tool tool_name:query_rss_feed tool_input:{"feed_name": "Reddit r/Boulder"}
+```
+
+```
+/invoke_tool tool_name:query_rss_feed tool_input:{"feed_name": "Reddit r/LocalLLaMA", "query": "new AI model"}
+```
+
+```
+/invoke_tool tool_name:query_rss_feed tool_input:{"feed_name": "Reddit r/LocalLLaMA", "limit": 3}
+```
+
 - Set up a standing prompt
 
 `/set_standing_prompt`
 
 Pick `schedule:"Hourly"`, then write a prompt, for example, if you do have the RSS query tool set up to include Reddit's LocalLLaMa community, you could try:
 `Summarize the latest news about AI development from LocalLlama`
-
 
 
 # Sample queries
@@ -85,6 +108,10 @@ Pick `schedule:"Hourly"`, then write a prompt, for example, if you do have the R
 ## From RSS (Based on r/LocalLlama)
 
 * Any recent observations about Qwen 3 among Local LLM enthusiasts today?
+
+### RSS standing prompt
+
+* /set_standing_prompt schedule:Hourly prompt:Summarize the latest news about AI development from LocalLlama. If there's any error retrieving news, or there's nothing new, don't assume anything or make anything up. Just give the plain facts as they are.
 
 ## PGVector chat history
 

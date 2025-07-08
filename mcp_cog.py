@@ -33,7 +33,7 @@ from fastmcp.exceptions import McpError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from b4a_config import B4ALoader, MCPConfig, resolve_value
-from source_handlers import FEEDPARSER_AVAILABLE
+from discord_aiagent.source_handlers import FEEDPARSER_AVAILABLE
 
 # XXX: Clean up exception handling & imports by better study of mcp-sse-client  # pylint: disable=fixme
 # Needed for ClosedResourceError/BrokenResourceError handling if not imported via sse/mcp
@@ -99,6 +99,7 @@ class StandingPrompt:
     id: uuid.UUID = field(default_factory=uuid.uuid4)
     created_at: float = field(default_factory=time.time)
     last_run_time: float = 0.0  # Timestamp of last execution
+    last_execution_timestamp: float = 0.0  # Timestamp to use for RSS filtering in next execution
 
     @property
     def interval_seconds(self) -> int:
@@ -127,6 +128,7 @@ class MCPCog(commands.Cog, RSSAgent):
         self._rss_cache_ttl: int = self.config.get('rss_cache_ttl', 300)  # Default 5 mins, configurable in agent TOML
 
         self.standing_prompts: List[StandingPrompt] = []
+        self._current_standing_prompt: StandingPrompt | None = None  # Track current standing prompt for context injection
 
         # LLM Client and Parameter Initialization
         llm_endpoint_config = self.config.get('llm_endpoint', {})
@@ -553,12 +555,25 @@ class MCPCog(commands.Cog, RSSAgent):
 
             tool_defs: list[Tool] = self.mcp_tools[server_name]
             logger.debug(f'Formatting {len(tool_defs)} MCP tools from active server `{server_name}` for OpenAI.')
+            
+            # Debug: Log tool structure for troubleshooting
+            for i, tool in enumerate(tool_defs):
+                logger.debug(f'Tool {i} from {server_name}: name={getattr(tool, "name", "NO_NAME")}, title={getattr(tool, "title", "NO_TITLE")}, description={getattr(tool, "description", "NO_DESC")[:50]}...')
 
             for tool in tool_defs:
                 # Validate Tool structure (basic check)
-                if not isinstance(tool, Tool) or not hasattr(tool, 'name') or not tool.name:
-                    logger.warning(f'Skipping malformed/nameless Tool from server `{server_name}`', tool_data=tool)
+                # Handle both fastmcp.tools.Tool and mcp.types.Tool
+                if not (isinstance(tool, Tool) or hasattr(tool, 'name')):
+                    logger.warning(f'Skipping non-Tool object from server `{server_name}`', tool_data=tool)
                     continue
+                
+                # Check if tool has a name (required for OpenAI function calling)
+                if not hasattr(tool, 'name') or not tool.name:
+                    logger.warning(f'Skipping nameless Tool from server `{server_name}`', tool_data=tool)
+                    continue
+                
+                # Log successful tool processing for debugging
+                logger.debug(f'Successfully processing tool `{tool.name}` from server `{server_name}`')
 
                 # Build JSON schema for parameters from tool.inputSchema
                 properties = {}
@@ -611,6 +626,9 @@ class MCPCog(commands.Cog, RSSAgent):
                     },
                 }
                 openai_tools.append(openai_tool)
+            
+            # Log summary of tools processed for this server
+            logger.info(f'Successfully processed {len([t for t in tool_defs if hasattr(t, "name") and t.name])} tools from server `{server_name}`')
 
         # Format RSS Query Tool
         if FEEDPARSER_AVAILABLE and self.b4a_data.rss_sources:
@@ -621,7 +639,7 @@ class MCPCog(commands.Cog, RSSAgent):
                     'type': 'function',
                     'function': {
                         'name': 'query_rss_feed',
-                        'description': 'Retrieves the latest entries from a configured RSS feed. Can optionally filter entries by a query string in the title or summary.',
+                        'description': 'Retrieves the latest entries from a configured RSS feed. Can optionally filter entries by a query string in the title or summary, and by timestamp to get only entries published since a given time.',
                         'parameters': {
                             'type': 'object',
                             'properties': {
@@ -637,6 +655,10 @@ class MCPCog(commands.Cog, RSSAgent):
                                 'limit': {
                                     'type': 'integer',
                                     'description': 'Optional: The maximum number of entries to return (default is 5).'
+                                },
+                                'since_timestamp': {
+                                    'type': 'number',
+                                    'description': 'Optional: Unix timestamp. Only return entries published/updated since this time. Useful for avoiding duplicate content in repeated queries.'
                                 }
                             },
                             'required': ['feed_name']  # Only feed_name is strictly required
@@ -714,7 +736,12 @@ class MCPCog(commands.Cog, RSSAgent):
                 logger.debug(f'No active tools available for LLM call for channel {channel_id}')
 
             # Format the system message dynamically
-            current_system_message = get_formatted_sysmsg(self.sysmsg_template, str(user_id))
+            # For standing prompts, we need to pass the last execution timestamp
+            last_execution_time = 0.0
+            if hasattr(self, '_current_standing_prompt') and self._current_standing_prompt:
+                last_execution_time = self._current_standing_prompt.last_execution_timestamp
+            
+            current_system_message = get_formatted_sysmsg(self.sysmsg_template, str(user_id), last_execution_time)
             if self.sys_postscript:
                 current_system_message += f'\n\n{self.sys_postscript}'
             replace_system_prompt(channel_history, current_system_message)
@@ -1033,6 +1060,61 @@ class MCPCog(commands.Cog, RSSAgent):
         final_message = '\n'.join(message_parts)
         await send_long_message(interaction, final_message.strip() or 'No B4A sources found or configured.', followup=True)
 
+    @app_commands.command(name='invoke_tool', description='Directly invoke a tool for testing and debugging')
+    @app_commands.describe(
+        tool_name='Name of the tool to invoke (e.g., query_rss_feed, add, magic_8_ball)',
+        tool_input='JSON string with tool parameters (e.g., {"feed_name": "Reddit r/LocalLLaMA", "query": "AI"})'
+    )
+    async def invoke_tool_slash(self, interaction: discord.Interaction, tool_name: str, tool_input: str = "{}"):
+        '''Directly invoke a tool for testing and debugging purposes.'''
+        logger.info(f'Command /invoke_tool invoked by {interaction.user} ({interaction.user.id})', tool_name=tool_name)
+        
+        await interaction.response.defer(thinking=True, ephemeral=False)
+        
+        try:
+            # Parse the tool input JSON
+            import json
+            try:
+                parsed_input = json.loads(tool_input) if tool_input.strip() else {}
+                if not isinstance(parsed_input, dict):
+                    raise ValueError("Tool input must be a JSON object")
+            except json.JSONDecodeError as e:
+                await send_long_message(interaction, f'❌ Invalid JSON in tool_input: {str(e)}', followup=True, ephemeral=True)
+                return
+            except ValueError as e:
+                await send_long_message(interaction, f'❌ {str(e)}', followup=True, ephemeral=True)
+                return
+            
+            # Execute the tool
+            logger.info(f'Executing tool {tool_name} with input: {parsed_input}')
+            result = await self.execute_tool(tool_name, parsed_input)
+            
+            # Format the result
+            if 'error' in result:
+                error_msg = f'❌ **Tool Error:** {result["error"]}'
+                await send_long_message(interaction, error_msg, followup=True, ephemeral=True)
+            elif 'result' in result:
+                # RSS tool returns 'result' key
+                success_msg = f'✅ **Tool Result:**\n{result["result"]}'
+                await send_long_message(interaction, success_msg, followup=True, ephemeral=False)
+            elif 'content' in result:
+                # MCP tools return 'content' key
+                content = result['content']
+                if isinstance(content, dict) and content.get('type') == 'text':
+                    success_msg = f'✅ **Tool Result:**\n{content["text"]}'
+                else:
+                    success_msg = f'✅ **Tool Result:**\n{json.dumps(content, indent=2)}'
+                await send_long_message(interaction, success_msg, followup=True, ephemeral=False)
+            else:
+                # Fallback for other result formats
+                success_msg = f'✅ **Tool Result:**\n{json.dumps(result, indent=2)}'
+                await send_long_message(interaction, success_msg, followup=True, ephemeral=False)
+                
+        except Exception as e:
+            logger.exception(f'Error executing tool {tool_name}', exc_info=True)
+            error_msg = f'❌ **Unexpected Error:** {str(e)}'
+            await send_long_message(interaction, error_msg, followup=True, ephemeral=True)
+
     # Chat Commands (Prefix and Slash)
 
     # Prefix form
@@ -1184,6 +1266,9 @@ class MCPCog(commands.Cog, RSSAgent):
         logger.info(f'Standing prompt {sp.id} for channel {sp.channel_id} is due. Text: "{sp.prompt_text[:50]}..."')
         # Update last_run_time *before* execution to prevent rapid retries on failure
         sp.last_run_time = current_time  # Mark as "attempted to run"
+        
+        # Store the current execution timestamp for RSS filtering
+        execution_timestamp = current_time
 
         # Try multiple methods to get the channel
         channel = None
@@ -1215,6 +1300,9 @@ class MCPCog(commands.Cog, RSSAgent):
             return
 
         try:
+            # Set the current standing prompt for context injection
+            self._current_standing_prompt = sp
+            
             await channel.send(f'🤖 Running scheduled prompt from <@{sp.user_id}>: "{sp.prompt_text}"')
             await self._handle_chat_logic(
                 sendable=channel,
@@ -1224,6 +1312,9 @@ class MCPCog(commands.Cog, RSSAgent):
                 stream=False,  # Scheduled tasks likely better non-streamed
                 attachments=None
             )
+            
+            # Update the last execution timestamp after successful execution
+            sp.last_execution_timestamp = execution_timestamp
             logger.info(f'Successfully ran standing prompt {sp.id}. Next run roughly in {sp.interval_seconds}s from now.')
         except Exception as e:
             logger.exception(f'Error executing standing prompt {sp.id} for channel {sp.channel_id}: {e}')
@@ -1231,6 +1322,9 @@ class MCPCog(commands.Cog, RSSAgent):
                 await channel.send(f'⚠️ Error running scheduled prompt: "{sp.prompt_text}". Will try again at the next scheduled interval. Please check bot logs.')
             except Exception as send_err:
                 logger.error(f'Failed to send error message for standing prompt {sp.id} to channel {sp.channel_id}: {send_err}')
+        finally:
+            # Clear the current standing prompt reference
+            self._current_standing_prompt = None
 
     @standing_prompt_loop.before_loop
     async def before_standing_prompt_loop(self):
@@ -1258,6 +1352,10 @@ class MCPCog(commands.Cog, RSSAgent):
         # Immediately execute the prompt using the interaction's channel
         try:
             logger.info(f'Executing initial standing prompt {new_prompt.id} for channel {new_prompt.channel_id}')
+            
+            # Set the current standing prompt for context injection
+            self._current_standing_prompt = new_prompt
+            
             await interaction.channel.send(f'🤖 Running scheduled prompt from <@{new_prompt.user_id}>: "{new_prompt.prompt_text}"')
             await self._handle_chat_logic(
                 sendable=interaction.channel,
@@ -1267,8 +1365,10 @@ class MCPCog(commands.Cog, RSSAgent):
                 stream=False,  # Scheduled tasks likely better non-streamed
                 attachments=None
             )
-            # Update last_run_time to prevent immediate re-execution in the loop
-            new_prompt.last_run_time = time.time()
+            # Update timestamps to prevent immediate re-execution in the loop
+            current_time = time.time()
+            new_prompt.last_run_time = current_time
+            new_prompt.last_execution_timestamp = current_time
             logger.info(f'Successfully ran initial standing prompt {new_prompt.id}. Next run roughly in {new_prompt.interval_seconds}s from now.')
         except Exception as e:
             logger.exception(f'Error executing initial standing prompt {new_prompt.id}: {e}')
@@ -1277,3 +1377,6 @@ class MCPCog(commands.Cog, RSSAgent):
                 await interaction.channel.send(f'⚠️ Error running initial prompt: "{prompt}". Will try again at the next scheduled interval.')
             except Exception as send_err:
                 logger.error(f'Failed to send error message for initial standing prompt {new_prompt.id}: {send_err}')
+        finally:
+            # Clear the current standing prompt reference
+            self._current_standing_prompt = None

@@ -13,16 +13,24 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 
-def get_formatted_sysmsg(sysmsg_template: str, discord_user_id: str | int) -> str:
+def get_formatted_sysmsg(sysmsg_template: str, discord_user_id: str | int, last_execution_time: float = 0.0) -> str:
     '''
     Formats the system message template with dynamic values.
     '''
     current_time_date_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')
+    
+    # Format last execution time if provided
+    last_execution_str = ''
+    if last_execution_time > 0.0:
+        last_execution_dt = datetime.datetime.fromtimestamp(last_execution_time)
+        last_execution_str = last_execution_dt.strftime('%Y-%m-%d %H:%M:%S %Z')
 
     # Prepare the data for formatting
     format_data = {
         'DISCORD_ID': str(discord_user_id),
-        'CURRENT_TIME_DATE': current_time_date_str
+        'CURRENT_TIME_DATE': current_time_date_str,
+        'LAST_EXECUTION_TIME': str(last_execution_time) if last_execution_time > 0.0 else '0',
+        'LAST_EXECUTION_DATE': last_execution_str
     }
 
     formatted_message = sysmsg_template.format_map(format_data)
