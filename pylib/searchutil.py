@@ -113,19 +113,39 @@ class VectorSearchEngine:
         chunks = []
         
         for entry_index, entry in enumerate(entries):
-            # Extract and convert title and summary
+            # Extract and convert title and content (prefer content over summary for Reddit RSS)
             title = entry.get('title', '')
+            content = entry.get('content', [{}])[0].get('value', '') if entry.get('content') else ''
             summary = entry.get('summary', '')
+            
+            # Use content if available, otherwise fall back to summary
+            body_text = content if content else summary
             
             # Convert HTML to Markdown
             title_md = self.html_to_markdown(title)
-            summary_md = self.html_to_markdown(summary)
+            body_md = self.html_to_markdown(body_text)
             
-            # Combine title and summary
-            full_text = f'{title_md}\n\n{summary_md}'.strip()
+            # Combine title and body
+            full_text = f'{title_md}\n\n{body_md}'.strip()
+            
+            # Debug: Log the original and converted text
+            logger.debug('Processing entry', 
+                        entry_index=entry_index,
+                        original_title=title[:100],
+                        original_content=content[:100] if content else 'No content',
+                        original_summary=summary[:100],
+                        converted_title=title_md[:100],
+                        converted_body=body_md[:100],
+                        full_text=full_text[:200])
             
             # Chunk the combined text
             text_chunks = self.chunk_text(full_text)
+            
+            # Debug: Log the chunks
+            logger.debug('Chunked text', 
+                        entry_index=entry_index,
+                        chunk_count=len(text_chunks),
+                        chunks=[chunk[:100] for chunk in text_chunks])
             
             # Create SearchChunk objects
             for chunk_index, chunk_text in enumerate(text_chunks):
@@ -177,6 +197,14 @@ class VectorSearchEngine:
             similarities = np.dot(chunk_embeddings, query_embedding) / (
                 np.linalg.norm(chunk_embeddings, axis=1) * np.linalg.norm(query_embedding) + 1e-8
             )
+            
+            # Debug: Log all similarities
+            logger.debug('All similarities', 
+                        query=query,
+                        similarities=[float(s) for s in similarities],
+                        max_similarity=float(np.max(similarities)),
+                        min_similarity=float(np.min(similarities)),
+                        threshold=cosine_threshold)
             
             # Find chunks above threshold
             scored_chunks = []
@@ -232,17 +260,21 @@ class VectorSearchEngine:
         
         for entry in entries:
             title = entry.get('title', '')
+            content = entry.get('content', [{}])[0].get('value', '') if entry.get('content') else ''
             summary = entry.get('summary', '')
+            
+            # Use content if available, otherwise fall back to summary
+            body_text = content if content else summary
             
             # Convert HTML to Markdown for better text matching
             title_md = self.html_to_markdown(title)
-            summary_md = self.html_to_markdown(summary)
+            body_md = self.html_to_markdown(body_text)
             
-            combined_text = f'{title_md} {summary_md}'.lower()
+            combined_text = f'{title_md} {body_md}'.lower()
             
             if query_lower in combined_text:
                 # Find the chunk containing the keyword
-                chunks = self.chunk_text(f'{title_md}\n\n{summary_md}')
+                chunks = self.chunk_text(f'{title_md}\n\n{body_md}')
                 best_chunk = ''
                 best_chunk_index = 0
                 

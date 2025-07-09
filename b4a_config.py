@@ -30,6 +30,8 @@ class RSSConfig:
     url: str
     refresh_interval: Optional[str] = None
     max_items: Optional[int] = None
+    cosine_similarity_threshold: Optional[float] = None
+    top_k: Optional[int] = None
 
 B4ASourceConfig = Union[  # For hinting
     MCPConfig,
@@ -200,18 +202,35 @@ class B4ALoader:
         # Extract optional fields
         refresh = config.get('refresh_interval')
         max_items = config.get('max_items')
+        cosine_threshold = config.get('cosine_similarity_threshold')
+        top_k = config.get('top_k')
+        
         validated_max_items: Optional[int] = None
         if max_items is not None:
             try: validated_max_items = int(max_items)
             except (ValueError, TypeError):
                  logger.warning(f'`@rss` source `{name}` has invalid `max_items` value. Ignoring.', value=max_items, filepath=filepath)
+        
+        validated_cosine_threshold: Optional[float] = None
+        if cosine_threshold is not None:
+            try: validated_cosine_threshold = float(cosine_threshold)
+            except (ValueError, TypeError):
+                 logger.warning(f'`@rss` source `{name}` has invalid `cosine_similarity_threshold` value. Ignoring.', value=cosine_threshold, filepath=filepath)
+        
+        validated_top_k: Optional[int] = None
+        if top_k is not None:
+            try: validated_top_k = int(top_k)
+            except (ValueError, TypeError):
+                 logger.warning(f'`@rss` source `{name}` has invalid `top_k` value. Ignoring.', value=top_k, filepath=filepath)
 
         # Basic validation passed, create RSSConfig object
         rss_conf = RSSConfig(
             name=name,
             url=rss_url,
             refresh_interval=str(refresh) if refresh else None,
-            max_items=validated_max_items
+            max_items=validated_max_items,
+            cosine_similarity_threshold=validated_cosine_threshold,
+            top_k=validated_top_k
         )
         self.rss_sources.append(rss_conf)
         logger.info(f'Successfully processed .rss source: `{name}`.', url=rss_url, refresh=rss_conf.refresh_interval, max_items=rss_conf.max_items)
