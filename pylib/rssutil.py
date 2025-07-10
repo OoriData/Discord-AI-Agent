@@ -182,3 +182,194 @@ class RSSAgent:
                 result_items.append(f'- Title: {title}\n  Link: {link}\n  Summary: {summary_short}')
         
         return result_items
+
+
+class RedditRSSAgent(RSSAgent):
+    """Specialized RSS agent for handling Reddit RSS feeds with their atypical structure."""
+    
+    def _extract_reddit_content(self, entry):
+        """Extract and clean Reddit-specific content from an entry."""
+        # Try to get content from the content field first (HTML content)
+        content = ''
+        if entry.get('content'):
+            if isinstance(entry['content'], list) and entry['content']:
+                content = entry['content'][0].get('value', '')
+            elif isinstance(entry['content'], str):
+                content = entry['content']
+        
+        # Fallback to summary if no content
+        if not content:
+            content = entry.get('summary', '')
+        
+        # Clean HTML entities and basic HTML tags
+        content = self._clean_reddit_html(content)
+        
+        return content
+    
+    def _clean_reddit_html(self, html_content):
+        """Clean Reddit HTML content by removing HTML entities and basic tags."""
+        import html
+        
+        if not html_content:
+            return ''
+        
+        # Decode HTML entities
+        content = html.unescape(html_content)
+        
+        # Remove basic HTML tags that are common in Reddit RSS
+        import re
+        
+        # Remove table tags and their content (Reddit uses tables for layout)
+        content = re.sub(r'<table[^>]*>.*?</table>', '', content, flags=re.DOTALL)
+        
+        # Remove common HTML tags but keep their text content
+        content = re.sub(r'<[^>]+>', '', content)
+        
+        # Clean up extra whitespace
+        content = re.sub(r'\s+', ' ', content).strip()
+        
+        return content
+    
+    def _extract_reddit_metadata(self, entry):
+        """Extract Reddit-specific metadata from an entry."""
+        # Extract author - Reddit format is /u/username
+        author = 'Unknown Author'
+        if entry.get('author'):
+            if isinstance(entry['author'], dict):
+                author_name = entry['author'].get('name', '')
+                # Remove /u/ prefix if present
+                if author_name.startswith('/u/'):
+                    author = author_name[3:]  # Remove /u/
+                else:
+                    author = author_name
+            elif isinstance(entry['author'], str):
+                author = entry['author']
+        
+        # Extract subreddit from category or feed metadata
+        subreddit = 'Unknown Subreddit'
+        if entry.get('category'):
+            if isinstance(entry['category'], dict):
+                subreddit = entry['category'].get('label', 'Unknown Subreddit')
+            elif isinstance(entry['category'], str):
+                subreddit = entry['category']
+        
+        # Extract post type (image, text, link)
+        post_type = 'text'
+        if entry.get('media:thumbnail'):
+            post_type = 'image'
+        elif entry.get('link') and 'reddit.com/gallery' in entry.get('link', ''):
+            post_type = 'gallery'
+        
+        return {
+            'author': author,
+            'subreddit': subreddit,
+            'post_type': post_type
+        }
+    
+    def _format_search_results(self, entries, search_results, query):
+        """Override to format Reddit-specific RSS entries."""
+        result_items = []
+        
+        # Create a mapping from entry to search result for easy lookup
+        result_map = {result.entry: result for result in search_results}
+        
+        for entry in entries:
+            # Extract basic fields
+            title = entry.get('title', 'No Title')
+            link = entry.get('link', 'No Link')
+            
+            # Extract and clean Reddit content
+            content = self._extract_reddit_content(entry)
+            content_short = (content[:200] + '...') if len(content) > 200 else content
+            
+            # Extract Reddit metadata
+            metadata = self._extract_reddit_metadata(entry)
+            
+            # Format post type indicator
+            post_type_indicator = ''
+            if metadata['post_type'] == 'image':
+                post_type_indicator = ' 📷'
+            elif metadata['post_type'] == 'gallery':
+                post_type_indicator = ' 🖼️'
+            
+            # Check if this entry has search result metadata
+            search_result = result_map.get(entry)
+            if search_result and query:
+                # Include search score and best matching chunk
+                score_text = f" (Score: {search_result.score:.3f})"
+                chunk_text = f"\n  Best Match: {search_result.best_chunk_text[:150]}..."
+                result_items.append(
+                    f'- Title: {title}{post_type_indicator}{score_text}\n'
+                    f'  Author: u/{metadata["author"]} | Subreddit: r/{metadata["subreddit"]}\n'
+                    f'  Link: {link}\n'
+                    f'  Content: {content_short}{chunk_text}'
+                )
+            else:
+                # Standard format for non-search results
+                result_items.append(
+                    f'- Title: {title}{post_type_indicator}\n'
+                    f'  Author: u/{metadata["author"]} | Subreddit: r/{metadata["subreddit"]}\n'
+                    f'  Link: {link}\n'
+                    f'  Content: {content_short}'
+                )
+        
+        return result_items
+
+    def _filter_entries_by_timestamp(self, entries, since_timestamp):
+        """Override to handle Reddit-specific timestamp fields."""
+        if since_timestamp is None:
+            return entries
+            
+        try:
+            since_time = float(since_timestamp)
+            filtered_entries = []
+            for entry in entries:
+                published_time = None
+                
+                # Reddit RSS feeds may use different timestamp fields
+                if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                    published_time = email.utils.mktime_tz(entry.published_parsed)
+                elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
+                    published_time = email.utils.mktime_tz(entry.updated_parsed)
+                elif hasattr(entry, 'published') and entry.published:
+                    try:
+                        parsed_date = email.utils.parsedate_tz(entry.published)
+                        if parsed_date:
+                            published_time = email.utils.mktime_tz(parsed_date)
+                    except:
+                        pass
+                elif hasattr(entry, 'created_utc'):
+                    # Reddit-specific timestamp field
+                    try:
+                        published_time = float(entry.created_utc)
+                    except (ValueError, TypeError):
+                        pass
+                
+                # Additional Reddit-specific timestamp handling
+                if published_time is None and hasattr(entry, 'id'):
+                    # Reddit post IDs contain timestamp information
+                    # Format: t3_<timestamp>_<random>
+                    post_id = entry.id
+                    if post_id.startswith('t3_'):
+                        try:
+                            # Extract timestamp from Reddit post ID
+                            timestamp_part = post_id.split('_')[1]
+                            published_time = float(timestamp_part)
+                        except (ValueError, IndexError):
+                            pass
+                
+                if published_time is None or published_time >= since_time:
+                    filtered_entries.append(entry)
+            logger.debug('Reddit entries after timestamp filter', count=len(filtered_entries))
+            return filtered_entries
+        except (ValueError, TypeError) as e:
+            logger.error('Invalid since_timestamp value', value=since_timestamp, error=str(e))
+            return None
+
+
+def create_rss_agent(agent_type: str, b4a_data, rss_feed_cache, rss_cache_ttl) -> RSSAgent:
+    """Factory function to create the appropriate RSS agent based on type."""
+    if agent_type == '@rss.reddit':
+        return RedditRSSAgent(b4a_data, rss_feed_cache, rss_cache_ttl)
+    else:
+        return RSSAgent(b4a_data, rss_feed_cache, rss_cache_ttl)

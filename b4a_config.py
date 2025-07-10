@@ -28,6 +28,7 @@ class RSSConfig:
     '''Configuration pulled from an @rss B4A source.'''
     name: str
     url: str
+    agent_type: str = '@rss'  # Default to standard RSS, can be '@rss.reddit' etc.
     refresh_interval: Optional[str] = None
     max_items: Optional[int] = None
     cosine_similarity_threshold: Optional[float] = None
@@ -158,6 +159,8 @@ class B4ALoader:
             self._handle_mcp_source(resolved_config, source_name, filepath)
         elif source_type == '@rss':
             self._handle_rss_source(resolved_config, source_name, filepath)
+        elif source_type == '@rss.reddit':
+            self._handle_rss_source(resolved_config, source_name, filepath, agent_type='@rss.reddit')
         # Add elif for other types like .openapi, .file, etc.
         else:
             logger.warning(f'No handler found for B4A source type `{source_type}`. Storing as unhandled.', name=source_name, type=source_type, filepath=filepath)
@@ -188,13 +191,13 @@ class B4ALoader:
         self.mcp_sources.append(mcp_conf)
         logger.info(f'Successfully processed .mcp source: `{name}`.', url=mcp_url)
 
-    def _handle_rss_source(self, config: dict[str, Any], name: str, filepath: str):
-        '''Handles type = '@rss' sources.'''
-        logger.debug('Handling .rss source.', name=name, filepath=filepath)
+    def _handle_rss_source(self, config: dict[str, Any], name: str, filepath: str, agent_type: str = '@rss'):
+        '''Handles type = '@rss' and '@rss.reddit' sources.'''
+        logger.debug('Handling RSS source.', name=name, filepath=filepath, agent_type=agent_type)
 
         rss_url = config.get('url')
         if not rss_url or not isinstance(rss_url, str):
-            err_msg = f'`@rss` source `{name}` is missing required `url` field or it\'s not a string.'
+            err_msg = f'`{agent_type}` source `{name}` is missing required `url` field or it\'s not a string.'
             logger.error(err_msg, filepath=filepath)
             self.load_errors.append((filepath, err_msg))
             return
@@ -209,31 +212,32 @@ class B4ALoader:
         if max_items is not None:
             try: validated_max_items = int(max_items)
             except (ValueError, TypeError):
-                 logger.warning(f'`@rss` source `{name}` has invalid `max_items` value. Ignoring.', value=max_items, filepath=filepath)
+                 logger.warning(f'`{agent_type}` source `{name}` has invalid `max_items` value. Ignoring.', value=max_items, filepath=filepath)
         
         validated_cosine_threshold: Optional[float] = None
         if cosine_threshold is not None:
             try: validated_cosine_threshold = float(cosine_threshold)
             except (ValueError, TypeError):
-                 logger.warning(f'`@rss` source `{name}` has invalid `cosine_similarity_threshold` value. Ignoring.', value=cosine_threshold, filepath=filepath)
+                 logger.warning(f'`{agent_type}` source `{name}` has invalid `cosine_similarity_threshold` value. Ignoring.', value=cosine_threshold, filepath=filepath)
         
         validated_top_k: Optional[int] = None
         if top_k is not None:
             try: validated_top_k = int(top_k)
             except (ValueError, TypeError):
-                 logger.warning(f'`@rss` source `{name}` has invalid `top_k` value. Ignoring.', value=top_k, filepath=filepath)
+                 logger.warning(f'`{agent_type}` source `{name}` has invalid `top_k` value. Ignoring.', value=top_k, filepath=filepath)
 
         # Basic validation passed, create RSSConfig object
         rss_conf = RSSConfig(
             name=name,
             url=rss_url,
+            agent_type=agent_type,
             refresh_interval=str(refresh) if refresh else None,
             max_items=validated_max_items,
             cosine_similarity_threshold=validated_cosine_threshold,
             top_k=validated_top_k
         )
         self.rss_sources.append(rss_conf)
-        logger.info(f'Successfully processed .rss source: `{name}`.', url=rss_url, refresh=rss_conf.refresh_interval, max_items=rss_conf.max_items)
+        logger.info(f'Successfully processed {agent_type} source: `{name}`.', url=rss_url, agent_type=agent_type, refresh=rss_conf.refresh_interval, max_items=rss_conf.max_items)
 
         # TODO: Implement actual RSS fetching/tool registration logic
         # Could use feedparser, possibly schedule updates & decide how to expose the data (e.g., register a simple tool

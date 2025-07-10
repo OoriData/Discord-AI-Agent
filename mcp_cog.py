@@ -55,7 +55,7 @@ except ImportError:
     class ConnectError(Exception): pass
     class ReadTimeout(Exception): pass
 
-from discord_aiagent.rssutil import RSSAgent
+from discord_aiagent.rssutil import RSSAgent, create_rss_agent
 from discord_aiagent.discordutil import send_long_message, handle_attachments, get_formatted_sysmsg
 from discord_aiagent.openaiutil import OpenAILLMWrapper, MissingLLMResponseError, LLMResponseError, ToolCallExecutionError, replace_system_prompt
 from discord.ext import tasks  # Ensure tasks is imported
@@ -108,11 +108,11 @@ class StandingPrompt:
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Disable parallelism for tokenizers to avoid warnings
 
 
-class MCPCog(commands.Cog, RSSAgent):
+class MCPCog(commands.Cog):
     def __init__(self, bot: commands.Bot, config: dict[str, Any], b4a_data: B4ALoader, pgvector_config: dict[str, Any]):
-        RSSAgent.__init__(self, b4a_data, {}, 0)  # Initialize RSSAgent with empty cache
         self.bot = bot
         self.config = config  # Agent config (LLM, etc.)
+        self.b4a_data = b4a_data
         self.mcp_urls: dict[str, str] = {}  # Keyed by MCPConfig.name, store URLs
         self.mcp_tools: dict[str, list[Tool]] = {}  # Keyed by MCPConfig.name, cache tool definitions
         self.message_history: dict[int, list[dict[str, Any]]] = {}
@@ -126,6 +126,12 @@ class MCPCog(commands.Cog, RSSAgent):
 
         self._rss_feed_cache: dict[str, tuple[float, Any]] = {}
         self._rss_cache_ttl: int = self.config.get('rss_cache_ttl', 300)  # Default 5 mins, configurable in agent TOML
+
+        # Create RSS agents for each configured RSS source
+        self._rss_agents: dict[str, RSSAgent] = {}
+        for rss_conf in self.b4a_data.rss_sources:
+            agent = create_rss_agent(rss_conf.agent_type, b4a_data, self._rss_feed_cache, self._rss_cache_ttl)
+            self._rss_agents[rss_conf.name] = agent
 
         self.standing_prompts: List[StandingPrompt] = []
         self._current_standing_prompt: StandingPrompt | None = None  # Track current standing prompt for context injection
@@ -444,7 +450,17 @@ class MCPCog(commands.Cog, RSSAgent):
         if tool_name == 'query_rss_feed':
             if not FEEDPARSER_AVAILABLE:
                 return {'error': 'RSS querying is disabled because the `feedparser` library is not installed.'}
-            return await self.execute_rss_query(tool_input)
+            
+            # Get the feed name from the tool input
+            feed_name = tool_input.get('feed_name')
+            if not feed_name:
+                return {'error': 'Missing required parameter: feed_name'}
+            
+            # Find the appropriate RSS agent for this feed
+            if feed_name in self._rss_agents:
+                return await self._rss_agents[feed_name].execute_rss_query(tool_input)
+            else:
+                return {'error': f'Configured RSS feed named `{feed_name}` not found.'}
 
         server_name_found: str | None = None  # B4A source name
 
