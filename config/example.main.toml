@@ -7,9 +7,12 @@ source_sets = [
 ]
 
 [llm_endpoint]
-# label = "Local LM Studio"
+# API type: "generic" (default, OpenAI-compatible), "openai" (OpenAI cloud), "claude" (Anthropic Claude)
+api_type = "generic"
 base_url = "http://localhost:1234/v1"
-api_key = "lm-studio"
+# API keys should be provided via environment variables:
+# - OPENAI_API_KEY for generic/openai providers
+# - ANTHROPIC_API_KEY for claude provider
 
 # Use this form if you're using LM Studio to run mlx-community/Qwen2.5-14B-Instruct-1M-4bit
 # model = "qwen2.5-14b-instruct-1m"

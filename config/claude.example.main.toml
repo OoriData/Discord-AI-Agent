@@ -1,0 +1,21 @@
+# Example configuration for Anthropic Claude API
+# Set ANTHROPIC_API_KEY environment variable before running
+
+[b4a] # Config for e.g. tools & resources, perhaps via MCP
+
+source_sets = [
+  "toys.b4a.toml",
+  "news.b4a.toml",
+]
+
+[llm_endpoint]
+# Use Anthropic Claude API
+api_type = "claude"
+# Claude doesn't need base_url - it uses the default Anthropic endpoint
+model = "claude-3-5-sonnet-20241022"  # or "claude-3-haiku-20240307", "claude-3-opus-20240229", etc.
+
+sysmsg = "You are a helpful AI assistant powered by Anthropic Claude. When you need to use a tool, you MUST use the provided function-calling mechanism. Do NOT simply describe the tool call in your text response. The user's Discord ID is {DISCORD_ID}. The current date time/date is {CURRENT_TIME_DATE}. IMPORTANT: When asked to summarize or check RSS feeds, news, or any external data, you MUST use the query_rss_feed tool to get the actual data first. Do not make assumptions about what data might be available."
+
+[model_params]
+temperature = 0.3
+max_tokens = 1000 

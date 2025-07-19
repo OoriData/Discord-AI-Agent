@@ -1,0 +1,36 @@
+# Example configuration for standing prompts with RSS timestamp filtering
+# This file demonstrates how to set up RSS feeds that can be used with standing prompts
+# to avoid duplicate content by using timestamp filtering.
+
+# RSS feed configuration
+[[@rss]]
+name = "tech_news"
+url = "https://feeds.feedburner.com/TechCrunch"
+refresh_interval = "1h"
+max_items = 20
+
+[[@rss]]
+name = "ai_news"
+url = "https://rss.cnn.com/rss/edition_technology.rss"
+refresh_interval = "30m"
+max_items = 15
+
+# Example standing prompt usage:
+# 
+# 1. Set up a standing prompt that uses RSS with timestamp filtering:
+#    /set_standing_prompt schedule:"Hourly" prompt:"Check for new AI news since {LAST_EXECUTION_TIME}. Use the query_rss_feed tool with since_timestamp={LAST_EXECUTION_TIME} to get only new entries from the ai_news feed."
+#
+# 2. The system will automatically inject the last execution timestamp into the prompt,
+#    allowing the AI to use it for RSS filtering to avoid duplicate content.
+#
+# 3. Available context variables in prompts:
+#    - {DISCORD_ID}: The Discord user ID
+#    - {CURRENT_TIME_DATE}: Current date and time
+#    - {LAST_EXECUTION_TIME}: Unix timestamp of last execution (for RSS filtering)
+#    - {LAST_EXECUTION_DATE}: Human-readable date of last execution
+#
+# 4. RSS tool parameters:
+#    - feed_name: Name of the configured RSS feed
+#    - query: Optional search term
+#    - limit: Maximum number of entries to return (default: 5)
+#    - since_timestamp: Unix timestamp to filter entries (new feature) 

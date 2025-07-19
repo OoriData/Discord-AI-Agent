@@ -1,0 +1,11 @@
+# local_files.example.b4a.toml
+# Configuration for connecting to the local files MCP server using Streamable HTTP transport
+
+[[context_source]]
+name = "local_files"
+description = "Local files MCP server for file system operations"
+type = "@mcp" # REQUIRED: Specifies the integration handler type.
+
+# Configuration specific to the '@mcp' handler:
+connection_method = "streamable_http" # REQUIRED: Use Streamable HTTP transport
+url = "http://localhost:8910" # REQUIRED: Endpoint for the MCP Server (Streamable HTTP) 

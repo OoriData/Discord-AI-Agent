@@ -6,17 +6,112 @@ For general MCP resources, see Arkestra:cookbook/mcp/README.md
 
 # Install
 
+## Basic Installation
+
 ```sh
 uv pip install -U .
 ```
 
+## LLM Provider Support
+
+The Discord AI Agent supports multiple LLM providers through an extensible architecture:
+
+### Available Providers
+
+- **Generic/OpenAI-compatible** (default): Works with LM Studio, Ollama, and other OpenAI-compatible endpoints
+- **OpenAI Cloud**: Direct integration with OpenAI's API
+- **Anthropic Claude**: Direct integration with Anthropic's Claude API
+
+### Installation with Provider Support
+
+Install with specific provider support:
+
+```sh
+# For OpenAI cloud support
+uv pip install -U ".[openai]"
+
+# For Claude support  
+uv pip install -U ".[claude]"
+
+# For both OpenAI and Claude
+uv pip install -U ".[openai,claude]"
+
+# For RSS functionality
+uv pip install -U ".[rss]"
+
+# For all features
+uv pip install -U ".[openai,claude,rss]"
+```
+
+### Environment Variables
+
+API keys should be provided via environment variables for security:
+
+```sh
+# For OpenAI/generic providers
+export OPENAI_API_KEY="your-openai-api-key"
+
+# For Claude provider
+export ANTHROPIC_API_KEY="your-anthropic-api-key"
+```
+
 # Configuration
+
+## Basic Configuration
 
 ```sh
 cp config/example.main.toml config/main.toml
 ```
 
 Then edit `main.toml` as needed. It specifies your LLM endpoint and model context resources such as MCP servers.
+
+## LLM Provider Configuration
+
+### Generic/OpenAI-compatible (Default)
+
+For LM Studio, Ollama, or other OpenAI-compatible endpoints:
+
+```toml
+[llm_endpoint]
+api_type = "generic"
+base_url = "http://localhost:1234/v1"
+model = "qwen3-1.7b-mlx"
+```
+
+### OpenAI Cloud
+
+For direct OpenAI API access:
+
+```toml
+[llm_endpoint]
+api_type = "openai"
+model = "gpt-4o-mini"
+```
+
+### Anthropic Claude
+
+For direct Claude API access:
+
+```toml
+[llm_endpoint]
+api_type = "claude"
+model = "claude-3-5-sonnet-20241022"
+```
+
+### Example Configurations
+
+Copy the appropriate example configuration:
+
+```sh
+# For OpenAI cloud
+cp config/openai.example.main.toml config/main.toml
+
+# For Claude
+cp config/claude.example.main.toml config/main.toml
+
+# For local LM Studio (default)
+cp config/example.main.toml config/main.toml
+```
 
 Follow the same pattern with `config/*news*.example.b4a.toml` depending on what context tools you plan to use, e.g.
 
@@ -94,8 +189,11 @@ Launch servers & bot, then DM the bot
 `/set_standing_prompt`
 
 Pick `schedule:"Hourly"`, then write a prompt, for example, if you do have the RSS query tool set up to include Reddit's LocalLLaMa community, you could try:
-`Summarize the latest news about AI development from LocalLlama`
+`Summarize any discussion of new AI models from LocalLlama`
 
+```
+/set_standing_prompt schedule:Hourly prompt:Summarize any discussion of new AI models from LocalLlama
+```
 
 # Sample queries
 

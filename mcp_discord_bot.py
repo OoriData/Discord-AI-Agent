@@ -124,10 +124,12 @@ def load_main_config(config_path: Path) -> dict[str, Any]:
     # Validate/Default LLM Endpoint config (remains important for the agent itself)
     config.setdefault('llm_endpoint', {})
     config['llm_endpoint'].setdefault('base_url', 'http://localhost:1234/v1')
-    if 'api_key' not in config['llm_endpoint']:
-         # Resolve directly here or let b4a_config handle env vars? Let b4a handle $VAR style.
-         config['llm_endpoint']['api_key'] = os.environ.get('OPENAI_API_KEY', 'lm-studio')  # Keep default/env fallback
-         logger.info('Using default or environment variable for LLM API key.', key_source='env/default' if config['llm_endpoint']['api_key'] == 'lm-studio' else 'config/env')
+    config['llm_endpoint'].setdefault('api_type', 'generic')  # Default to generic OpenAI-compatible
+    
+    # Remove api_key from config - it should come from environment variables
+    if 'api_key' in config['llm_endpoint']:
+        logger.warning("api_key found in config file. API keys should be provided via environment variables for security.")
+        del config['llm_endpoint']['api_key']
 
     # Validate/Default Model Params
     config.setdefault('model_params', {})

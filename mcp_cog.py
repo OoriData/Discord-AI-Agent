@@ -57,7 +57,8 @@ except ImportError:
 
 from discord_aiagent.rssutil import RSSAgent, create_rss_agent
 from discord_aiagent.discordutil import send_long_message, handle_attachments, get_formatted_sysmsg
-from discord_aiagent.openaiutil import OpenAILLMWrapper, MissingLLMResponseError, LLMResponseError, ToolCallExecutionError, replace_system_prompt
+from discord_aiagent.openaiutil import MissingLLMResponseError, LLMResponseError, ToolCallExecutionError, replace_system_prompt
+from discord_aiagent.llm_providers import LLMProviderFactory
 from discord.ext import tasks  # Ensure tasks is imported
 
 
@@ -140,16 +141,21 @@ class MCPCog(commands.Cog):
         llm_endpoint_config = self.config.get('llm_endpoint', {})
         model_params_config = self.config.get('model_params', {})
 
+        # Get API type and initialize appropriate provider
+        self.api_type = llm_endpoint_config.get('api_type', 'generic')
+        logger.info(f'Initializing LLM provider: {self.api_type}')
+
         # Initialize LLM Client
         llm_init_params = {k: resolve_value(v) for k, v in llm_endpoint_config.items() if k in ALLOWED_FOR_LLM_INIT}
-        if 'api_key' not in llm_init_params:
-            llm_init_params['api_key'] = 'missing-key'  # Or handle error
-        if not llm_init_params.get('base_url'):
-            raise ValueError('LLM \'base_url\' is required.')
+        if self.api_type == 'generic':
+            if not llm_init_params.get('base_url'):
+                raise ValueError('LLM `base_url` config is required for generic providers')
+            if not os.environ.get('OPENAI_API_KEY'):  # Default to UNSPECIFIED if not set
+                os.environ['OPENAI_API_KEY'] = 'UNSPECIFIED'
 
         # Configure LLM Chat Parameters (Combine defaults, model_params, llm_endpoint)
         llm_chat_params = {
-             'model': llm_endpoint_config.get('label', 'local-model'),  # Default model name
+             'model': llm_endpoint_config.get('model', 'local-model'),  # Default model name
              'temperature': 0.3, 'max_tokens': 1000,  # Base defaults
         }
         # Apply overrides from [model_params] first
@@ -168,10 +174,10 @@ class MCPCog(commands.Cog):
         logger.debug(f'System message template: {self.sysmsg_template}')
 
         try:
-            self.llm_client = OpenAILLMWrapper(llm_init_params, llm_chat_params, self)
-            logger.info('AsyncOpenAI client initialized.', **llm_init_params)
+            self.llm_client = LLMProviderFactory.create_provider(self.api_type, llm_init_params, llm_chat_params, self)
+            logger.info(f'{self.api_type} LLM provider initialized.', **llm_init_params)
         except Exception as e:
-            logger.exception('Failed to initialize OpenAI client', config=llm_init_params)
+            logger.exception(f'Failed to initialize {self.api_type} LLM provider', config=llm_init_params)
             raise e
 
         # Log B4A Loading Summary
@@ -744,8 +750,10 @@ class MCPCog(commands.Cog):
             if openai_tools:
                 extra_chat_params = {
                     'tools': openai_tools,
-                    'tool_choice': 'auto'
                 }
+                # Only include tool_choice for providers that support it (OpenAI/generic, not Claude)
+                if self.api_type in ['openai', 'generic']:
+                    extra_chat_params['tool_choice'] = 'auto'
                 logger.debug(f'Including {len(openai_tools)} tools in LLM call for channel {channel_id}')
             else:
                 extra_chat_params = {}
@@ -1331,6 +1339,7 @@ class MCPCog(commands.Cog):
             
             # Update the last execution timestamp after successful execution
             sp.last_execution_timestamp = execution_timestamp
+            # Only log success if we reach this point without exception
             logger.info(f'Successfully ran standing prompt {sp.id}. Next run roughly in {sp.interval_seconds}s from now.')
         except Exception as e:
             logger.exception(f'Error executing standing prompt {sp.id} for channel {sp.channel_id}: {e}')
@@ -1385,6 +1394,7 @@ class MCPCog(commands.Cog):
             current_time = time.time()
             new_prompt.last_run_time = current_time
             new_prompt.last_execution_timestamp = current_time
+            # Only log success if we reach this point without exception
             logger.info(f'Successfully ran initial standing prompt {new_prompt.id}. Next run roughly in {new_prompt.interval_seconds}s from now.')
         except Exception as e:
             logger.exception(f'Error executing initial standing prompt {new_prompt.id}: {e}')
