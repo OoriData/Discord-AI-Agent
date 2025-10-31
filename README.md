@@ -30,7 +30,7 @@ Install with specific provider support:
 # For OpenAI cloud support
 uv pip install -U ".[openai]"
 
-# For Claude support  
+# For Claude support
 uv pip install -U ".[claude]"
 
 # For both OpenAI and Claude
@@ -160,7 +160,7 @@ Launch servers & bot, then DM the bot
 
 - Try out some sample queries listed below
 
-- Check some of your registered tools
+- Check some of your registered tools (just raw tool calls without LLM intervention)
 
 ```
 /invoke_tool tool_name:add tool_input:{"a": 1234, "b": 5678}
@@ -184,9 +184,7 @@ Launch servers & bot, then DM the bot
 /invoke_tool tool_name:query_rss_feed tool_input:{"feed_name": "Reddit r/LocalLLaMA", "limit": 3}
 ```
 
-- Set up a standing prompt
-
-`/set_standing_prompt`
+- Set up a standing prompt using `/set_standing_prompt`
 
 Pick `schedule:"Hourly"`, then write a prompt, for example, if you do have the RSS query tool set up to include Reddit's LocalLLaMa community, you could try:
 `Summarize any discussion of new AI models from LocalLlama`
@@ -223,9 +221,7 @@ uv pip install ogbujipt pgvector asyncpg sentence-transformers
 
 ### Enable the Feature
 
-Set the `AIBOT_PGVECTOR_HISTORY_ENABLED` environment variable to `true`:
-
-You can either use a connection string or elaborated credentials.
+Set `enabled = true` in the `[pgvector_history]` section of the config file, e.g. `main.toml`. You must then set some required environment variables, either based on a PG connection string or on elaborated credentials.
 
 ### Configure with DB connection string:
 

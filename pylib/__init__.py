@@ -4,6 +4,7 @@
 
 import os
 import urllib.parse
+from typing import Any
 
 import structlog
 from sentence_transformers import SentenceTransformer
@@ -11,32 +12,59 @@ from sentence_transformers import SentenceTransformer
 logger = structlog.get_logger()
 
 
-def assemble_pgvector_config():
-    pgvector_enabled = os.environ.get('AIBOT_PGVECTOR_HISTORY_ENABLED', 'false').lower() == 'true'
+def assemble_pgvector_config(config: dict[str, Any] | None = None):
+    '''
+    Assemble PGVector configuration from config file and environment variables.
+
+    Args:
+        config: Main config dict. If None, checks for legacy AIBOT_PGVECTOR_HISTORY_ENABLED env var.
+
+    Returns:
+        PGVector config dict if enabled, None otherwise.
+    '''
+    # Check if PGVector history is enabled via config or legacy env var
+    pgvector_enabled = False
+    if config and 'pgvector_history' in config:
+        pgvector_history_config = config.get('pgvector_history', {})
+        pgvector_enabled = pgvector_history_config.get('enabled', False)
+        logger.info('PGVector history enabled via config file.')
+    else:
+        # Fallback to legacy environment variable check
+        pgvector_enabled = os.environ.get('AIBOT_PGVECTOR_HISTORY_ENABLED', 'false').lower() == 'true'
+        if pgvector_enabled:
+            logger.warning('PGVector history enabled via deprecated AIBOT_PGVECTOR_HISTORY_ENABLED env var. Consider using [pgvector_history] section in config file instead.')
+
     if not pgvector_enabled:
         return None
 
-    logger.info('PGVector history is ENABLED via environment variable.')
+    # Validate required environment variables are present
+    conn_str = os.environ.get('AIBOT_PG_CONNECT_STRING')
+    # If using connection string, we need at least that
+    if conn_str:
+        required_vars = []  # Connection string alone is sufficient
+    else:
+        # If using individual components, we need these
+        required_vars = ['AIBOT_PG_DB_NAME', 'AIBOT_PG_USER', 'AIBOT_PG_USER_PASSWORD']
+
+    missing_vars = [var for var in required_vars if not os.environ.get(var)]
+    if missing_vars:
+        logger.warning(
+            f'PGVector history enabled, but missing required environment variables: {missing_vars}. '
+            'PGVector initialization may fail. Please set these variables or provide AIBOT_PG_CONNECT_STRING.'
+        )
+        # Don't disable here - let it fail during initialization with a clearer error
+
     # Use resolve_value for potential env var in model name?
     embedding_model_name = os.environ.get('AIBOT_PG_EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
     logger.info(f'Loading sentence transformer model: {embedding_model_name}')
     embedding_model = SentenceTransformer(embedding_model_name)
     logger.info('Sentence transformer model loaded.')
 
-    # XXX: Needs to take into account case of AIBOT_PG_CONNECT_STRING == 'COMPOSE'
-    # # Validate required PGVector env vars are present
-    # required_pg_vars = ['AIBOT_PG_DB_NAME', 'AIBOT_PG_USER', 'AIBOT_PG_PASSWORD']
-    # missing_vars = [var for var in required_pg_vars if not os.environ.get(var)]
-    # if missing_vars:
-    #     logger.error(f'PGVector enabled, but missing required environment variables: {missing_vars}. Disabling.')
-    #     pgvector_config['enabled'] = False  # Disable if config is incomplete
-    #     pgvector_enabled = False
-
     pgvector_config = {
         'enabled': True,
         'embedding_model_name': embedding_model_name,
         'embedding_model': embedding_model,
-        'conn_str': os.environ.get('AIBOT_PG_CONNECT_STRING'),
+        'conn_str': conn_str,
         'su_conn_str': os.environ.get('AIBOT_PG_SUPERUSER_CONNECT_STRING'),
         'table_name': os.environ.get('AIBOT_PG_TABLE_NAME', 'discord_chat_history'),
         'db_name': os.environ.get('AIBOT_PG_DB_NAME'),

@@ -15,6 +15,11 @@ from pathlib import Path
 # Save original exception hook before any imports that might install Rich tracebacks
 _original_excepthook = sys.excepthook
 
+# Suppress deprecation warning from discord.py's internal aiohttp WebSocket timeout usage
+# This is expected to be fixed in a future discord.py release
+import warnings
+warnings.filterwarnings('ignore', message=".*parameter 'timeout' of type 'float' is deprecated.*", category=DeprecationWarning)
+
 import fire
 import discord
 from discord.ext import commands
@@ -125,7 +130,7 @@ def load_main_config(config_path: Path) -> dict[str, Any]:
     config.setdefault('llm_endpoint', {})
     config['llm_endpoint'].setdefault('base_url', 'http://localhost:1234/v1')
     config['llm_endpoint'].setdefault('api_type', 'generic')  # Default to generic OpenAI-compatible
-    
+
     # Remove api_key from config - it should come from environment variables
     if 'api_key' in config['llm_endpoint']:
         logger.warning("api_key found in config file. API keys should be provided via environment variables for security.")
@@ -164,7 +169,7 @@ def main(
     # Use upper case for consistency
     effective_loglevel_upper = effective_loglevel.upper()
     setup_logging(classic_tracebacks=classic_tracebacks, log_level_str=effective_loglevel_upper)
-    
+
     # Configure traceback handling based on classic_tracebacks option
     if classic_tracebacks:
         logger.info('Using classic Python tracebacks (Rich tracebacks disabled).')
@@ -174,11 +179,11 @@ def main(
     else:
         logger.info('Installing Rich tracebacks for enhanced error display.')
         rich.traceback.install(show_locals=False, extra_lines=1, word_wrap=True)
-    
+
     # Log the source *after* setup_logging might have changed the level
     if log_source != "default":
         logger.info(f"Log level '{effective_loglevel_upper}' set via {log_source}.")
- 
+
     # Argument Handling (Token & Config Path)
     if not discord_token or discord_token is True:  # If user accidentally does --discord-token alone, it resolves to True
         discord_token = os.environ.get('AIBOT_DISCORD_TOKEN')
@@ -220,20 +225,11 @@ def main(
 
     bot = commands.Bot(command_prefix=['!'], intents=intents, description='MCP Discord Bot')
 
-    pgvector_config = assemble_pgvector_config()
-    #     try:
-    #         pgvector_config = assemble_pgvector_config()
-    #     except ImportError:
-    #         logger.error('PGVector enabled, but required libraries (ogbujipt, sentence_transformers, asyncpg, pgvector?) are not installed. Disabling.')
-    #         pgvector_enabled = False
-    #         pgvector_config = {'enabled': False}
-    #     except Exception as e:
-    #         logger.exception('Error initializing PGVector configuration or loading embedding model. Disabling PGVector history.')
-    #         pgvector_enabled = False
-    #         pgvector_config = {'enabled': False}
-    # else:
-    #     logger.info('PGVector history is DISABLED.')
-    #     pgvector_config = {'enabled': False}
+    # Assemble PGVector config (may return None if disabled)
+    pgvector_config = assemble_pgvector_config(main_config)
+    # Normalize to dict format for MCPCog (empty dict with enabled=False if None)
+    if pgvector_config is None:
+        pgvector_config = {'enabled': False}
 
     logger.info('Initializing MCPCog…')
     try:
